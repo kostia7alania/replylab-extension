@@ -1,10 +1,13 @@
-import { activate, fixture, canUseApp, suggestReplies } from './core.js';
+import { activate, fixture, canUseApp } from './core.js';
 
 const $ = (id) => document.getElementById(id);
 const storage = chrome.storage.local;
-let { user = null, model = '' } = await storage.get(['user', 'model']);
+let { user = null, model = '', mode = 'mock' } = await storage.get(['user', 'model', 'mode']);
 const sample = 'Вы: Как прошёл твой день?\nСобеседник: Насыщенно! Теперь хочется куда-нибудь выбраться и переключиться.';
 $('model').value = model;
+$('mode').value = mode === 'gpt' ? 'gpt' : 'mock';
+$('gpt-settings').hidden = mode !== 'gpt';
+$('result-source').textContent = mode === 'gpt' ? 'Ваш GPT через локальный коннектор' : 'Локальные примеры';
 
 function notify(text, error = false) {
   $('message').textContent = text;
@@ -57,7 +60,8 @@ $('selection').addEventListener('click', async () => {
   } catch { notify('Выделите текст на обычной странице и откройте ReplyLab с панели расширений.', true); }
 });
 $('expand').addEventListener('click', () => chrome.runtime.openOptionsPage());
-$('mode').addEventListener('change', () => {
+$('mode').addEventListener('change', async () => {
+  await storage.set({ mode: $('mode').value });
   $('gpt-settings').hidden = $('mode').value !== 'gpt';
   $('result-source').textContent = $('mode').value === 'gpt' ? 'Ваш GPT через локальный коннектор' : 'Локальные примеры';
 });
@@ -65,29 +69,17 @@ $('connect').addEventListener('click', async () => {
   const granted = await chrome.permissions.request({ origins: ['http://127.0.0.1/*'] });
   notify(granted ? 'Доступ к локальному коннектору разрешён.' : 'Локальный коннектор не разрешён.', !granted);
 });
+$('model').addEventListener('change', () => storage.set({ model: $('model').value.trim() }));
 $('generate').addEventListener('click', async () => {
   if (!canUseApp(user)) { notify('Включите локальный доступ кодом REPLYLAB-LOCAL.', true); return; }
   const text = $('conversation').value.trim();
   if (!text) { notify('Добавьте диалог или нажмите «Пример».', true); return; }
   $('generate').disabled = true; notify('Готовим варианты…');
   try {
-    let replies;
-    if ($('mode').value === 'mock') replies = suggestReplies(text, $('tone').value);
-    else {
-      const permitted = await chrome.permissions.contains({ origins: ['http://127.0.0.1/*'] });
-      if (!permitted) throw new Error('Нажмите «Разрешить локальный коннектор».');
-      model = $('model').value.trim();
-      if (!model) throw new Error('Укажите точный ID модели вашего API.');
-      await storage.set({ model });
-      const response = await fetch('http://127.0.0.1:4318/replies', { method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-ReplyLab': '1' },
-        body: JSON.stringify({ text, tone: $('tone').value, model }), signal: AbortSignal.timeout(45000) });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || `Ошибка коннектора: ${response.status}`);
-      if (!Array.isArray(data.replies) || data.replies.length !== 3 || data.replies.some((r) => typeof r.text !== 'string' || typeof r.reason !== 'string')) throw new Error('Коннектор вернул неверный формат.');
-      replies = data.replies;
-    }
-    renderReplies(replies); notify($('mode').value === 'mock' ? 'Три локальных примера. Данные остались на устройстве.' : 'Ответы получены через ваш коннектор.');
+    await storage.set({ mode: $('mode').value, model: $('model').value.trim() });
+    const result = await chrome.runtime.sendMessage({ type: 'replylab:suggest', text, tone: $('tone').value });
+    if (!result?.ok) throw new Error(result?.error || 'Не удалось получить ответы.');
+    renderReplies(result.replies); notify($('mode').value === 'mock' ? 'Три локальных примера. Данные остались на устройстве.' : 'Ответы получены через ваш коннектор.');
   } catch (error) { notify(error.message === 'Failed to fetch' ? 'Коннектор недоступен. Запустите npm start по инструкции.' : error.message, true); }
   finally { $('generate').disabled = false; }
 });

@@ -1,18 +1,24 @@
 # ReplyLab
 
-A reply lab in Chrome: local fixtures or your own GPT.
+Reply suggestions next to the message field in a Tinder chat. Local fixtures or your GPT.
 
 [Русский](../README.md) · [Application flow](architecture.md)
 
-![ReplyLab](images/replylab.png)
+**[Download ReplyLab 0.2.0](https://github.com/kostia7alania/replylab-extension/releases/latest/download/ReplyLab-0.2.0.zip)**
+
+![ReplyLab next to the message field](images/inline.png)
+
+*Local chat fixture. This is not a live account screenshot.*
 
 ## Start in 3 steps
 
 | Step | Action |
 |---|---|
-| **1. Install** | Download and extract the repository. Open `chrome://extensions`, enable **Developer mode**, click **Load unpacked** and select the `extension` folder. |
-| **2. Open** | Click ReplyLab in the Chrome extensions toolbar. |
-| **3. Try** | Enter the code below, click **Включить тест**, then **Пример** and **Предложить ответы**. |
+| **1. Install** | Extract the ZIP. Open `chrome://extensions`, enable **Developer mode**, click **Load unpacked** and select the folder containing `manifest.json`. |
+| **2. Enable** | Open ReplyLab from the extensions toolbar, enter the code below and click **Включить тест**. |
+| **3. Open a chat** | Open a Tinder chat at `/app/messages/...` and refresh the tab. ReplyLab appears next to the message field. |
+
+**Updating from 0.1.0:** replace the files in the existing extension folder with those from the new ZIP, click **Reload** on its `chrome://extensions` card, then refresh the chat tab.
 
 ```text
 REPLYLAB-LOCAL
@@ -22,22 +28,32 @@ This code enables local developer access. No account or API key is required for 
 
 ```mermaid
 flowchart LR
-    A[Install extension] --> B[Open ReplyLab]
-    B --> C[Enter test code]
-    C --> D[Click Пример]
-    D --> E[Get sample replies]
+    A[Context] --> B[Tone]
+    B --> C[Generate replies]
+    C --> D[Insert or copy]
+    D --> E[Review and send manually]
 ```
 
-## Test scenarios
+## Use it in a chat
 
-| Scenario | Purpose |
+| Control | Result |
 |---|---|
-| **Пример** → **Предложить ответы** | Load the sample, then show three fixture replies |
-| **Копировать** | Copy the selected reply |
-| **Из выделения** | Import selected text from the active page |
-| **Сценарии доступа** | **Открыт** (active), **Пробный** (trial), **Истёк** (expired), **Выход** (sign out) |
+| Draft, selected page text or **Контекст** | Supply the text to respond to |
+| Tone → **Предложить ответы** | Generate three suggestions |
+| **Вставить** / **Копировать** | Insert a suggestion / copy it |
+| **Заменить черновик** | Confirm replacing a non-empty draft |
+| **Настроить ReplyLab** | Open the source and local access settings |
 
-The default **Локальный тест** mode uses fixtures without network requests. The code applies only to the local test profile.
+Context uses the first non-empty value: **draft → selected page text → panel context field**. ReplyLab never sends the message for you.
+
+<details>
+<summary>Try it without a chat page</summary>
+
+In the extension window, click **Пример** → **Предложить ответы**. It also provides **Из выделения** and **Сценарии доступа**: **Открыт** (active), **Пробный** (trial), **Истёк** (expired), **Выход** (sign out).
+
+![ReplyLab window](images/replylab.png)
+
+</details>
 
 ## Connect your GPT
 
@@ -60,17 +76,16 @@ Enter your key after the first command and press Enter; the input stays hidden. 
 
 The connector uses the [official Chat Completions API](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create). The local test code does not provide external API access. Stop the connector with Ctrl+C.
 
-Only fixtures and a local API stub have been tested; a real GPT call is a separate check.
+The selected source and model are shared by the extension window and the chat panel through the background worker. Only fixtures and a local API stub have been tested; a real GPT call is a separate check.
 
-## Inside the extension
+## Version 0.2.0 scope
 
-```mermaid
-flowchart TB
-    UI[ReplyLab interface] --> Access[Local developer access]
-    UI --> Fixtures[Sample conversations and replies]
-    Access --> Storage[(Extension storage)]
-    classDef local fill:#dcfce7,stroke:#15803d,color:#14532d
-    class UI,Access,Fixtures,Storage local
-```
+| Available | Boundary |
+|---|---|
+| Panel on `/app/messages/...` | Requires one visible, editable `textarea` |
+| Manual context, tone, insert and copy | No automatic full-history or profile extraction |
+| Local fixtures or the saved GPT source | Defaults to **Локальный тест**, without network requests |
+
+This implements part of a reply assistant. The screenshot comes from a local fixture; compatibility with the current live page layout is a separate check.
 
 Source: [`extension/`](../extension/). Developer access contract: [`canUseApp(user)`](../extension/core.js). Run checks with `npm test`.
