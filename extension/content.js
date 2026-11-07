@@ -131,7 +131,7 @@ function createPanel(composer, anchor, env) {
       }
       function receive(message) {
         if (message.id !== id) return;
-        if (message.type === 'delta' && current() && number === requestNumber) $('.live-result').textContent += message.text || '';
+        // Reply deltas contain structured JSON. Show only validated reply cards.
         if (message.type === 'result') finish(null, message.result);
         if (message.type === 'error') finish(new Error(message.error || 'Поток ответа прерван.'));
       }
