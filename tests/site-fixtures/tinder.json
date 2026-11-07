@@ -1,0 +1,10 @@
+{
+  "routing": {"pathname":"/app/messages/demo-chat","params":{"matchId":"demo-chat"}},
+  "profile":{"user":{"_id":"synthetic-self"}},
+  "recs":{"recs":{"queues":{"main":["659200800000000000000001"]}}},
+  "entities":{
+    "matches":{"demo-chat":{"person":"659200800000000000000001","messages":["m1","m2"]}},
+    "profiles":{"659200800000000000000001":{"_id":"659200800000000000000001","name":"Тестовый профиль","bio":"Синтетический пример для проверки интерфейса.","photos":[{"url":"https://example.test/photo.jpg","processedFiles":[{"url":"https://example.test/photo-small.jpg"}]}]}},
+    "messages":{"m1":{"_id":"m1","from":"synthetic-other","to":"synthetic-self","message":"Как прошёл день?","sent_date":"2026-11-07T10:00:00Z"},"m2":{"_id":"m2","from":"synthetic-self","to":"synthetic-other","message":"Хорошо, спасибо!","sent_date":"2026-11-07T10:01:00Z"}}
+  }
+}

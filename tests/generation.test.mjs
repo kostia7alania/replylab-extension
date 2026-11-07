@@ -1,10 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { generateReplies } from '../extension/generation.js';
+import { generateReplies, prepareTask } from '../extension/generation.js';
 import { fixture } from '../extension/core.js';
 
 const input = { text: 'Привет! Как прошёл день?', tone: 'friendly' };
 const noNetwork = () => { throw new Error('Unexpected network request'); };
+
+test('photo consent controls actual vision attachments as well as context URLs', () => {
+  const payload = { text: 'hello', context: { profile: { photos: ['https://example.test/photo.jpg'] } } };
+  assert.deepEqual(prepareTask('replies', payload, {}).attachments, []);
+  assert.deepEqual(prepareTask('replies', payload, {}).context.profile.photos, []);
+  assert.deepEqual(prepareTask('replies', { ...payload, includePhotos: true }, {}).attachments, ['https://example.test/photo.jpg']);
+});
 
 test('local generation never uses network and expired profiles cannot generate', async () => {
   assert.equal((await generateReplies(input, { user: fixture('active'), fetchImpl: noNetwork })).length, 3);

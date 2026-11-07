@@ -1,91 +1,45 @@
 # ReplyLab
 
-Reply suggestions next to the message field in a Tinder chat. Local fixtures or your GPT.
+Inline reply helpers for Tinder and WhatsApp Web, with custom styles, conversation context and a local library.
 
-[Русский](../README.md) · [Application flow](architecture.md)
+[Русская инструкция](../README.md) · [Capabilities and verification](features.md) · [Research and limitations (RU)](research.ru.md)
 
-**[Download ReplyLab 0.2.0](https://github.com/kostia7alania/replylab-extension/releases/latest/download/ReplyLab-0.2.0.zip)**
+**[Download 0.3.0](https://github.com/kostia7alania/replylab-extension/releases/latest/download/ReplyLab-0.3.0.zip)**
 
-![ReplyLab next to the message field](images/inline.png)
+![Synthetic chat fixture](images/inline.png)
 
-*Local chat fixture. This is not a live account screenshot.*
+| 1. Extract | 2. Install | 3. Try |
+|---|---|---|
+| Unzip the download | `chrome://extensions` → Developer mode → Load unpacked → **ReplyLab/extension** | Open ReplyLab → enter `REPLYLAB-LOCAL` → enable local test → load the sample → suggest replies |
 
-## Start in 3 steps
-
-| Step | Action |
-|---|---|
-| **1. Install** | Extract the ZIP. Open `chrome://extensions`, enable **Developer mode**, click **Load unpacked** and select the folder containing `manifest.json`. |
-| **2. Enable** | Open ReplyLab from the extensions toolbar, enter the code below and click **Включить тест**. |
-| **3. Open a chat** | Open a Tinder chat at `/app/messages/...` and refresh the tab. ReplyLab appears next to the message field. |
-
-**Updating from 0.1.0:** replace the files in the existing extension folder with those from the new ZIP, click **Reload** on its `chrome://extensions` card, then refresh the chat tab.
-
-```text
-REPLYLAB-LOCAL
-```
-
-This code enables local developer access. No account or API key is required for this mode.
+Local mode uses fixed examples and requires no account or API key. Open a supported conversation and reload the tab. For WhatsApp, first grant access using **Подключения и разрешения → Включить WhatsApp Web**. The studio and inline panel support multiple interface languages; choose English under **Настройки → Язык**.
 
 ```mermaid
 flowchart LR
-    A[Context] --> B[Tone]
-    B --> C[Generate replies]
-    C --> D[Insert or copy]
-    D --> E[Review and send manually]
+  A[Loaded chat or profile] --> B[Context + style]
+  B --> C[1–3 replies]
+  C --> D[Insert and review]
 ```
 
-## Use it in a chat
+![Assistant studio, synthetic data](images/studio.png)
 
-| Control | Result |
+## Your model
+
+Run `npm start` from **ReplyLab** using Node.js 22+. No dependency installation or build is required. Grant the extension access to `http://127.0.0.1:4318`, choose your provider and exact model IDs, then select **Свой GPT** as the response source.
+
+| Provider | Setup |
 |---|---|
-| Draft, selected page text or **Контекст** | Supply the text to respond to |
-| Tone → **Предложить ответы** | Generate three suggestions |
-| **Вставить** / **Копировать** | Insert a suggestion / copy it |
-| **Заменить черновик** | Confirm replacing a non-empty draft |
-| **Настроить ReplyLab** | Open the source and local access settings |
+| OpenAI API | Set `OPENAI_API_KEY` before starting the server |
+| OpenRouter | Set `OPENROUTER_API_KEY`, or sign in through OAuth |
+| ChatGPT | Use the official OAuth flow in studio settings; direct inference availability depends on account permissions |
+| Ollama / compatible | Set `COMPATIBLE_API_BASE=http://127.0.0.1:11434/v1`; loopback endpoints may omit an API key |
 
-Context uses the first non-empty value: **draft → selected page text → panel context field**. ReplyLab never sends the message for you.
+API keys and OAuth credentials stay on your server. Library exports exclude them. Local test access does not grant external model access. [Detailed commands and storage behavior (RU)](development.ru.md).
 
-<details>
-<summary>Try it without a chat page</summary>
+## Behavior and limits
 
-In the extension window, click **Пример** → **Предложить ответы**. It also provides **Из выделения** and **Сценарии доступа**: **Открыт** (active), **Пробный** (trial), **Истёк** (expired), **Выход** (sign out).
+Custom styles, notes, memories, assistant chats, imported conversations, analytics and scheduling share one validated local library. Optional sync, search and expiring share links use your server. Only loaded conversation history can be captured. Photo upload is an explicit per-request choice. Replacing a draft requires confirmation.
 
-![ReplyLab window](images/replylab.png)
+Automatic sending starts disabled and requires separate consent on each device. It only attempts explicitly marked automatic items in a visible matching conversation with unchanged incoming messages and no existing draft. WhatsApp automatic sending stays blocked until a reliable self-account identity source is verified. Platform rules can restrict third-party integrations; no ban-free guarantee is offered. [Primary sources](research.ru.md#почему-паузы-не-дают-защиты-от-блокировки).
 
-</details>
-
-## Connect your GPT
-
-Requires **Node.js 22+** and a valid API key. From the repository folder:
-
-```sh
-read -s OPENAI_API_KEY
-export OPENAI_API_KEY
-npm start
-```
-
-Enter your key after the first command and press Enter; the input stays hidden. The key remains in the local connector process and is never stored in the extension.
-
-| UI control | Action |
-|---|---|
-| **Источник** | Select **Свой GPT** |
-| **Модель вашего API** | Enter the exact model ID available to your API account |
-| **Разрешить локальный коннектор** | Grant access to `http://127.0.0.1:4318` |
-| **Предложить ответы** | Send the current conversation through your connector |
-
-The connector uses the [official Chat Completions API](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create). The local test code does not provide external API access. Stop the connector with Ctrl+C.
-
-The selected source and model are shared by the extension window and the chat panel through the background worker. Only fixtures and a local API stub have been tested; a real GPT call is a separate check.
-
-## Version 0.2.0 scope
-
-| Available | Boundary |
-|---|---|
-| Panel on `/app/messages/...` | Requires one visible, editable `textarea` |
-| Manual context, tone, insert and copy | No automatic full-history or profile extraction |
-| Local fixtures or the saved GPT source | Defaults to **Локальный тест**, without network requests |
-
-This implements part of a reply assistant. The screenshot comes from a local fixture; compatibility with the current live page layout is a separate check.
-
-Source: [`extension/`](../extension/). Developer access contract: [`canUseApp(user)`](../extension/core.js). Run checks with `npm test`.
+Validation: `npm test`. The optional `tests/browser.mjs` exercises the actual extension worker and HTTP server against synthetic site state and mocked AI transport. Live account compatibility and live OAuth access remain separate checks.

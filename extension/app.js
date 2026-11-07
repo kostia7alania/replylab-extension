@@ -1,4 +1,6 @@
 import { activate, fixture, canUseApp } from './core.js';
+import { rpc, stream } from './client.js';
+import { permissionFor, serverOrigin } from './server-client.js';
 
 const $ = (id) => document.getElementById(id);
 const storage = chrome.storage.local;
@@ -77,10 +79,50 @@ $('generate').addEventListener('click', async () => {
   $('generate').disabled = true; notify('Готовим варианты…');
   try {
     await storage.set({ mode: $('mode').value, model: $('model').value.trim() });
+    if ($('model').value.trim()) await checked('save-settings', { settings: { suggestionModel: $('model').value.trim() } });
     const result = await chrome.runtime.sendMessage({ type: 'replylab:suggest', text, tone: $('tone').value });
     if (!result?.ok) throw new Error(result?.error || 'Не удалось получить ответы.');
-    renderReplies(result.replies); notify($('mode').value === 'mock' ? 'Три локальных примера. Данные остались на устройстве.' : 'Ответы получены через ваш коннектор.');
+    renderReplies(result.replies); notify($('mode').value === 'mock' ? `Локальных примеров: ${result.replies.length}. Данные остались на устройстве.` : 'Ответы получены через ваш коннектор.');
   } catch (error) { notify(error.message === 'Failed to fetch' ? 'Коннектор недоступен. Запустите npm start по инструкции.' : error.message, true); }
   finally { $('generate').disabled = false; }
 });
 refreshAccess();
+
+let studio;
+function showFailure(error) { notify(error.message || 'Действие не выполнено.', true); }
+async function checked(action, payload) {
+  const result = await rpc(action, payload);
+  if (!result?.ok) throw new Error(result?.error || 'Действие не выполнено.');
+  return result;
+}
+$('authorize-server').addEventListener('click', async () => {
+  try {
+    const origin = serverOrigin($('server-url').value);
+    const granted = await chrome.permissions.request({ origins: [permissionFor(origin)] });
+    if (!granted) throw new Error('Доступ к вашему серверу не разрешён.');
+    await checked('save-settings', { settings: { serverUrl: origin } });
+    notify('Ваш сервер разрешён.'); await studio?.refresh();
+  } catch (error) { showFailure(error); }
+});
+$('enable-whatsapp').addEventListener('click', async () => {
+  try {
+    const granted = await chrome.permissions.request({ origins: ['https://web.whatsapp.com/*'] });
+    if (!granted) throw new Error('Доступ к WhatsApp Web не разрешён.');
+    await checked('whatsapp-enable'); notify('WhatsApp подключён. Обновите открытую вкладку WhatsApp Web.');
+  } catch (error) { showFailure(error); }
+});
+$('save-provider-key').addEventListener('click', async () => {
+  try {
+    await checked('provider-credentials', { provider: $('key-provider').value, apiKey: $('provider-key').value, baseUrl: $('provider-base').value || undefined });
+    $('provider-key').value = ''; notify('Ключ сохранён только на вашем сервере.');
+  } catch (error) { showFailure(error); }
+});
+try {
+  const state = await checked('library');
+  $('server-url').value = state.state.settings.serverUrl;
+  const { mountWorkspace } = await import('./workspace.js');
+  studio = await mountWorkspace($('workspace'), { rpc, stream });
+  const { activeConversation } = await storage.get('activeConversation');
+  if (location.hash) await studio.open(decodeURIComponent(location.hash.slice(1)), activeConversation);
+  window.addEventListener('hashchange', () => studio.open(decodeURIComponent(location.hash.slice(1)), activeConversation));
+} catch (error) { showFailure(error); }

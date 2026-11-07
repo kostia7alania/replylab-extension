@@ -1,0 +1,1 @@
+{"id":"synthetic-chat@c.us","personId":"synthetic-person","name":"Тестовый контакт","personProfilePicUrl":"https://example.test/avatar.jpg","messages":[{"id":"wa1","body":"Тестовый вопрос","type":"chat","ts_sec":1794045600,"isFromMe":false},{"id":"wa2","body":"Тестовый ответ","type":"chat","ts_sec":1794045660,"isFromMe":true}]}

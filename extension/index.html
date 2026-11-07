@@ -28,9 +28,22 @@
       <button id="generate" class="primary generate" type="button">Предложить ответы <span aria-hidden="true">✦</span></button>
       <p id="message" class="message" role="status" aria-live="polite"></p>
     </section>
-    <section class="results" aria-labelledby="results-title"><div class="section-line"><h2 id="results-title">Три направления</h2><span id="result-source">Локальные примеры</span></div><div id="suggestions"><div class="empty"><span aria-hidden="true">↳</span><p>Здесь появятся варианты.<br>Выберите тот, который звучит как вы.</p></div></div></section>
+    <section class="results" aria-labelledby="results-title"><div class="section-line"><h2 id="results-title">Варианты ответа</h2><span id="result-source">Локальные примеры</span></div><div id="suggestions"><div class="empty"><span aria-hidden="true">↳</span><p>Здесь появятся варианты.<br>Выберите тот, который звучит как вы.</p></div></div></section>
     <details class="scenarios"><summary>Сценарии доступа</summary><p>Меняют только локальный тестовый профиль.</p><div class="scenario-buttons"><button data-scenario="active">Открыт</button><button data-scenario="trial">Пробный</button><button data-scenario="expired">Истёк</button><button data-scenario="signed_out">Выход</button></div></details>
-    <footer>Вы выбираете слова. ReplyLab ничего не отправляет за вас.</footer>
+    <details class="connections"><summary>Подключения и разрешения</summary>
+      <label for="server-url">Мой сервер</label><input id="server-url" value="http://127.0.0.1:4318" type="url">
+      <button id="authorize-server" type="button" class="text-button">Разрешить мой сервер</button>
+      <button id="enable-whatsapp" type="button" class="text-button">Включить WhatsApp Web</button>
+      <details><summary>Сохранить ключ у себя на сервере</summary>
+        <p>Сначала задайте токен сервера в настройках студии. Ключ не входит в библиотеку.</p>
+        <label for="key-provider">Провайдер</label><select id="key-provider"><option value="openai">OpenAI API</option><option value="openrouter">OpenRouter</option><option value="compatible">Совместимый API</option></select>
+        <label for="provider-key">API-ключ</label><input id="provider-key" type="password" autocomplete="off">
+        <label for="provider-base">Адрес совместимого API</label><input id="provider-base" type="url" placeholder="http://127.0.0.1:11434/v1">
+        <button id="save-provider-key" type="button" class="text-button">Сохранить на моём сервере</button>
+      </details>
+    </details>
+    <section id="workspace" aria-label="ReplyLab Studio"></section>
+    <footer>Автоматическая отправка выключена по умолчанию и требует отдельного разрешения на этом устройстве.</footer>
   </main>
 </body>
 </html>
