@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "ReplyLab",
+  "description": "Лаборатория ответов: локальные сценарии, варианты сообщений и свой GPT.",
+  "version": "0.1.0",
+  "permissions": ["storage", "activeTab", "scripting", "clipboardWrite"],
+  "optional_host_permissions": ["http://127.0.0.1/*"],
+  "action": {"default_title": "Открыть ReplyLab", "default_popup": "index.html"},
+  "options_ui": {"page": "index.html", "open_in_tab": true},
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src http://127.0.0.1:4318; object-src 'none'; base-uri 'none'; form-action 'none'"
+  }
+}

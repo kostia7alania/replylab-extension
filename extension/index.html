@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ReplyLab</title>
+  <link rel="icon" href="mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <main class="studio">
+    <header class="masthead">
+      <div class="brand"><img src="mark.svg" width="42" height="42" alt=""><div><strong>ReplyLab</strong><p>Найдите свои слова</p></div></div>
+      <button id="expand" class="icon-button" title="Открыть в отдельной вкладке" aria-label="Открыть в отдельной вкладке">↗</button>
+    </header>
+    <div class="status-row"><span class="status-dot"></span><span id="access-label">Тестовый доступ не включён</span><span class="local-label">Локальная лаборатория</span></div>
+    <section class="access-panel" aria-labelledby="access-title">
+      <div><h1 id="access-title">Сначала попробуем?</h1><p>Один код, готовый диалог, три варианта ответа.</p></div>
+      <form id="activate-form" class="code-form"><label class="sr-only" for="code">Тестовый код</label><input id="code" autocomplete="off" spellcheck="false" placeholder="REPLYLAB-LOCAL" required><button type="submit" class="primary">Включить тест</button></form>
+    </section>
+    <section class="workspace" aria-labelledby="conversation-title">
+      <div class="section-line"><h2 id="conversation-title">Ваш диалог</h2><button id="sample" class="text-button">Пример</button><button id="selection" class="text-button">Из выделения</button></div>
+      <label class="sr-only" for="conversation">Текст диалога</label>
+      <textarea id="conversation" rows="5" maxlength="10000" placeholder="Вставьте фрагмент диалога или нажмите «Пример»"></textarea>
+      <div class="controls"><label>Тон<select id="tone"><option value="friendly">Тёплый</option><option value="playful">Игривый</option><option value="concise">Короткий</option></select></label><label>Источник<select id="mode"><option value="mock">Локальный тест</option><option value="gpt">Свой GPT</option></select></label></div>
+      <div id="gpt-settings" hidden class="gpt-settings"><label for="model">Модель вашего API</label><input id="model" placeholder="Точный ID модели"><p>Сначала запустите локальный коннектор по инструкции в репозитории.</p><button id="connect" class="text-button" type="button">Разрешить локальный коннектор</button></div>
+      <button id="generate" class="primary generate" type="button">Предложить ответы <span aria-hidden="true">✦</span></button>
+      <p id="message" class="message" role="status" aria-live="polite"></p>
+    </section>
+    <section class="results" aria-labelledby="results-title"><div class="section-line"><h2 id="results-title">Три направления</h2><span id="result-source">Локальные примеры</span></div><div id="suggestions"><div class="empty"><span aria-hidden="true">↳</span><p>Здесь появятся варианты.<br>Выберите тот, который звучит как вы.</p></div></div></section>
+    <details class="scenarios"><summary>Сценарии доступа</summary><p>Меняют только локальный тестовый профиль.</p><div class="scenario-buttons"><button data-scenario="active">Открыт</button><button data-scenario="trial">Пробный</button><button data-scenario="expired">Истёк</button><button data-scenario="signed_out">Выход</button></div></details>
+    <footer>Вы выбираете слова. ReplyLab ничего не отправляет за вас.</footer>
+  </main>
+</body>
+</html>
