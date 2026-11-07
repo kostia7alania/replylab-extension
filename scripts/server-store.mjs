@@ -8,6 +8,7 @@ const COLLECTIONS = ['styles', 'memories', 'assistantChats', 'conversations', 'e
 const FORBIDDEN = new Set(['__proto__', 'prototype', 'constructor']);
 const MAX_BYTES = 8 * 1024 * 1024;
 export class StoreConflictError extends Error { constructor(message) { super(message); this.status = 409; } }
+export class StoreNotFoundError extends Error { constructor(message) { super(message); this.status = 404; } }
 
 export function emptyState() {
   return { version: 1, styles: [], notes: {}, memories: [], assistantChats: [], conversations: [], events: [], schedules: [], settings: {} };
@@ -38,7 +39,7 @@ export function validateState(input) {
     if (!Array.isArray(value[name])) throw new TypeError(`Раздел ${name} должен быть массивом.`);
     const seen = new Set();
     result[name] = value[name].map(record => {
-      if (!record || Array.isArray(record) || typeof record !== 'object' || typeof record.id !== 'string' || !record.id || record.id.length > 200 || seen.has(record.id)) throw new TypeError(`Некорректный или повторяющийся id: ${name}`);
+      if (!record || Array.isArray(record) || typeof record !== 'object' || typeof record.id !== 'string' || !record.id || record.id.length > (name === 'conversations' ? 1000 : 200) || seen.has(record.id)) throw new TypeError(`Некорректный или повторяющийся id: ${name}`);
       seen.add(record.id);
       for (const field of ['createdAt', 'updatedAt']) if (record[field] !== undefined && !Number.isFinite(Date.parse(record[field]))) throw new TypeError(`Некорректная дата: ${name}.${field}`);
       if (record.messages !== undefined && !Array.isArray(record.messages)) throw new TypeError('История сообщений должна быть массивом.');
@@ -50,7 +51,7 @@ export function validateState(input) {
   if (value.notes !== undefined) {
     if (!value.notes || Array.isArray(value.notes) || typeof value.notes !== 'object') throw new TypeError('Заметки должны быть словарём.');
     for (const [id, note] of Object.entries(value.notes)) {
-      if (!id || id.length > 200 || !note || typeof note.text !== 'string' || note.text.length > 100000 || (note.updatedAt !== undefined && !Number.isFinite(Date.parse(note.updatedAt)))) throw new TypeError('Некорректная заметка.');
+      if (!id || id.length > 1000 || !note || typeof note.text !== 'string' || note.text.length > 100000 || (note.updatedAt !== undefined && !Number.isFinite(Date.parse(note.updatedAt)))) throw new TypeError('Некорректная заметка.');
     }
     result.notes = structuredClone(value.notes);
   }
@@ -63,6 +64,20 @@ export function validateState(input) {
 }
 
 const timestamp = record => Date.parse(record?.updatedAt ?? record?.createdAt ?? '') || 0;
+const resourceId = value => {
+  if (typeof value !== 'string' || !/^[\p{L}\p{N}_.:-]{1,200}$/u.test(value) || FORBIDDEN.has(value)) throw new TypeError('Некорректный ID записи.');
+  return value;
+};
+function templateRecord(value) {
+  checked(value);
+  const allowed = new Set(['id', 'name', 'prompt', 'scope', 'version', 'createdAt', 'updatedAt']);
+  if (!value || Array.isArray(value) || Object.keys(value).some(key => !allowed.has(key))) throw new TypeError('Неизвестное поле шаблона.');
+  if (typeof value.name !== 'string' || !value.name.trim() || value.name.length > 120 || typeof value.prompt !== 'string' || !value.prompt.trim() || value.prompt.length > 20000) throw new TypeError('Нужны имя и инструкция шаблона до 20 000 символов.');
+  if (!['reply', 'assistant-base', 'assistant-chat', 'assistant-profile'].includes(value.scope)) throw new TypeError('Неизвестная область шаблона.');
+  if (!Number.isSafeInteger(value.version) || value.version < 1) throw new TypeError('Некорректная версия шаблона.');
+  for (const field of ['createdAt', 'updatedAt']) if (!Number.isFinite(Date.parse(value[field]))) throw new TypeError('Некорректная дата шаблона.');
+  return { id: resourceId(value.id), name: value.name.trim(), prompt: value.prompt.trim(), scope: value.scope, version: value.version, createdAt: new Date(value.createdAt).toISOString(), updatedAt: new Date(value.updatedAt).toISOString() };
+}
 export function mergeStates(base, incoming) {
   const left = validateState(base); const right = validateState(incoming);
   const rawIncoming = incoming?.state ?? incoming;
@@ -84,8 +99,8 @@ export function createStore({ directory = '.replylab', now = () => Date.now() } 
     try {
       const stat = await lstat(filename); if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Недопустимый файл хранилища.');
       const data = JSON.parse(await readFile(filename, 'utf8'));
-      return { state: validateState(data.state), revision: Number.isSafeInteger(data.revision) ? data.revision : 0, shares: Array.isArray(data.shares) ? data.shares : [], claims: data.claims && typeof data.claims === 'object' && !Array.isArray(data.claims) ? data.claims : {} };
-    } catch (error) { if (error.code === 'ENOENT') return { state: emptyState(), revision: 0, shares: [], claims: {} }; throw error; }
+      return { state: validateState(data.state), revision: Number.isSafeInteger(data.revision) ? data.revision : 0, shares: Array.isArray(data.shares) ? data.shares : [], claims: data.claims && typeof data.claims === 'object' && !Array.isArray(data.claims) ? data.claims : {}, templates: (data.templates ?? []).map(templateRecord) };
+    } catch (error) { if (error.code === 'ENOENT') return { state: emptyState(), revision: 0, shares: [], claims: {}, templates: [] }; throw error; }
   }
   async function save(data) {
     const serialized = JSON.stringify(data);
@@ -103,13 +118,76 @@ export function createStore({ directory = '.replylab', now = () => Date.now() } 
   function transaction(operation) {
     const result = queue.then(async () => {
       const data = await load(); const value = await operation(data);
-      data.revision++; await save(data); return value === undefined ? { state: data.state, revision: data.revision } : value;
+      data.revision++; await save(data); return value === undefined ? { state: data.state, revision: data.revision } : { ...value, revision: data.revision };
     });
     queue = result.catch(() => {}); return result;
   }
   return {
     async read() { await queue; const { state, revision } = await load(); return { state, revision }; },
     merge(input) { validateState(input); return transaction(data => { data.state = mergeStates(data.state, input); }); },
+    async catalog() { const { state, revision } = await this.read(); return { items: state.styles.filter(item => !item.deleted && item.shared), revision, source: 'own-server' }; },
+    saveCatalog(value, id) {
+      checked(value);
+      return transaction(data => {
+        const selectedId = resourceId(id ?? value.id ?? randomUUID());
+        const previous = data.state.styles.find(item => item.id === selectedId);
+        if (id && (!previous || previous.deleted || !previous.shared)) throw new StoreNotFoundError('Стиль каталога не найден.');
+        const date = new Date(now()).toISOString();
+        const item = validateLibrary({ ...emptyState(), styles: [{ ...previous, ...value, id: selectedId, shared: true, deleted: false, createdAt: previous?.createdAt ?? date, updatedAt: date }] }).styles[0];
+        if (!item.prompt.trim()) throw new TypeError('Инструкция стиля не может быть пустой.');
+        data.state = validateState({ ...data.state, styles: [...data.state.styles.filter(record => record.id !== item.id), item] });
+        return { item };
+      });
+    },
+    deleteCatalog(id) {
+      resourceId(id);
+      return transaction(data => {
+        const item = data.state.styles.find(item => item.id === id && !item.deleted && item.shared);
+        if (!item) throw new StoreNotFoundError('Стиль каталога не найден.');
+        data.state = validateState({ ...data.state, styles: data.state.styles.map(record => record.id === id ? { id, deleted: true, createdAt: record.createdAt, updatedAt: new Date(now()).toISOString() } : record) });
+        return { deleted: true };
+      });
+    },
+    async templates() { await queue; const data = await load(); return { items: data.templates, revision: data.revision, source: 'own-server' }; },
+    saveTemplate(value, id) {
+      checked(value);
+      return transaction(data => {
+        const selectedId = resourceId(id ?? value.id ?? randomUUID());
+        const previous = data.templates.find(item => item.id === selectedId);
+        if (id && !previous) throw new StoreNotFoundError('Шаблон не найден.');
+        if (!previous && data.templates.length >= 1000) throw new RangeError('Максимум 1000 шаблонов.');
+        const date = new Date(now()).toISOString();
+        const item = templateRecord({ ...previous, ...value, id: selectedId, version: (previous?.version ?? 0) + 1, createdAt: previous?.createdAt ?? date, updatedAt: date });
+        data.templates = [...data.templates.filter(record => record.id !== selectedId), item]; return { item };
+      });
+    },
+    deleteTemplate(id) {
+      resourceId(id);
+      return transaction(data => {
+        if (!data.templates.some(item => item.id === id)) throw new StoreNotFoundError('Шаблон не найден.');
+        data.templates = data.templates.filter(item => item.id !== id); return { deleted: true };
+      });
+    },
+    async searchPastReplies({ query, current_account_only = true, accountId, platform, limit = 10 } = {}) {
+      const phrase = normalize(query);
+      if (!phrase || phrase.length > 500 || typeof current_account_only !== 'boolean' || !Number.isInteger(limit) || limit < 1 || limit > 20) throw new TypeError('Нужен поисковый запрос до 500 символов и лимит 1–20.');
+      if (current_account_only && (typeof accountId !== 'string' || !accountId)) throw new TypeError('Для поиска нужен подтверждённый аккаунт.');
+      const words = [...new Set(phrase.match(/[\p{L}\p{N}]+/gu) ?? [])].slice(0, 30);
+      const { state } = await this.read(); const found = [];
+      for (const conversation of state.conversations.filter(item => !item.deleted && (!current_account_only || item.accountId === accountId) && (!platform || item.platform === platform))) {
+        let incoming = '';
+        for (const message of conversation.messages) {
+          if (['assistant', 'incoming'].includes(message.role)) { incoming = message.text; continue; }
+          if (!['user', 'outgoing'].includes(message.role)) { incoming = ''; continue; }
+          const haystack = normalize(incoming + '\n' + message.text);
+          const score = haystack.includes(phrase) ? words.length + 1 : words.filter(word => haystack.includes(word)).length;
+          if (score) found.push({ score, conversationId: conversation.id, chatId: conversation.chatId, accountId: conversation.accountId, platform: conversation.platform,
+            theirText: incoming.slice(0, 5000), myReply: message.text.slice(0, 5000), sentAt: message.createdAt ?? null, messageId: message.id,
+            partial: conversation.partial || !incoming || incoming.length > 5000 || message.text.length > 5000 });
+        }
+      }
+      return found.sort((a, b) => b.score - a.score || (Date.parse(b.sentAt) || 0) - (Date.parse(a.sentAt) || 0)).slice(0, limit).map(({ score, ...item }) => item);
+    },
     async search(query) {
       const text = normalize(query); if (!text || text.length > 500) throw new TypeError('Введите поисковый запрос до 500 символов.');
       const { state } = await this.read(); const results = [];

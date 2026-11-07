@@ -2,3 +2,4 @@
 
 .workspace-app .ws-field{display:grid;gap:5px}.workspace-app .ws-field.ws-check{display:flex;align-items:center;gap:8px}
 .workspace-app .ws-analytics-chart{margin:0;padding:12px;border:1px solid #dce5f0;border-radius:12px;background:#fff}.workspace-app .ws-analytics-chart figcaption{font-size:13px;font-weight:600;margin-bottom:8px}.workspace-app .ws-analytics-chart svg{display:block;width:100%;height:auto;min-height:130px}.workspace-app .ws-analytics-chart text{fill:#415a73}
+.workspace-app .ws-tool-card{display:grid;gap:10px;margin-top:12px;padding-top:12px;border-top:1px solid #c2d8cb;white-space:normal}.workspace-app .ws-tool-card p{white-space:pre-wrap;overflow-wrap:anywhere}.workspace-app .ws-dialog{width:min(620px,calc(100vw - 36px));max-height:85vh;overflow:auto;border:1px solid #c2cede;border-radius:16px;padding:22px;color:#20364d}.workspace-app .ws-dialog::backdrop{background:rgb(15 31 52 / 45%)}.workspace-app .ws-error{color:#a32839}

@@ -1,7 +1,8 @@
-import { LIMITS, renderStyle } from './library.js';
+import { LIMITS, renderStyle, getConversationNote, getNoteKey } from './library.js';
 import { translate } from './locales.js';
 import { aggregate90days } from './analytics.js';
 import { incomingSnapshot } from './site-context.js';
+import { DEFAULT_ASSISTANT_PROMPTS, assistantPrompt, templateValues } from './prompt-context.js';
 
 const LANGUAGES = { ru: 'Русский', en: 'English', de: 'Deutsch', fr: 'Français', es: 'Español', pt: 'Português', da: 'Dansk', sv: 'Svenska', fi: 'Suomi', lt: 'Lietuvių', pl: 'Polski' };
 const NAV = {
@@ -51,7 +52,7 @@ export async function mountWorkspace(container, { rpc, stream }) {
   toolbar.append(title);
   app.append(toolbar, tabs, status, panel); container.replaceChildren(app);
   let state, tab = 'start', selectedStyle = null, selectedChat = null, selectedConversation = null;
-  let attachments = [], exported = false, fieldCount = 0, assistantSending = false, assistantController = null, onboardingStep = 0;
+  let attachments = [], attachmentOwner = null, exported = false, fieldCount = 0, assistantSending = false, assistantController = null, onboardingStep = 0;
   const pendingNotes = new Map();
   const t = (ru, en) => translate(ru, en, state?.settings.language ?? 'ru');
   const say = (text, error = false) => { status.textContent = text; status.classList.toggle('error', error); };
@@ -176,6 +177,7 @@ export async function mountWorkspace(container, { rpc, stream }) {
     }
     const edit = styles.find(item => item.id === selectedStyle);
     if (edit) stylesEditor(edit); else if (!styles.length) stylesEditor({});
+    styleCatalog();
   }
   function stylesEditor(item) {
     panel.querySelector('[data-style-editor]')?.remove();
@@ -189,52 +191,201 @@ export async function mountWorkspace(container, { rpc, stream }) {
       suggestionCount: field(t('Количество ответов', 'Reply count'), item.suggestionCount ?? 3, { type: 'number', min: 1, max: 3 }),
       shared: field(t('Показывать в локальном общем каталоге', 'Show in local shared catalog'), item.shared, { type: 'checkbox' }),
       useHistory: field(t('Включать похожие мои прошлые ответы в контекст', 'Include similar previous replies of mine in context'), item.useHistory, { type: 'checkbox' }),
+      includePhotos: field(t('Рекомендовать фото для этого стиля', 'Recommend photos for this style'), item.includePhotos, { type: 'checkbox' }),
     };
     const conditions = ['opener', 'incoming', 'stale', 'empty'].map(value => ({ value, ...field(value, (item.conditions ?? ['opener', 'incoming', 'stale', 'empty']).includes(value), { type: 'checkbox' }) }));
     const previewName = field('{{name}}', 'Alex'), previewBio = field('{{bio}}', ''), previewTranscript = field('{{transcript}}', '', { textarea: true, rows: 2 });
     const preview = node('pre', '', 'ws-preview');
-    const updatePreview = () => { const chatId = state.conversations.find(value => value.id === selectedConversation)?.chatId;
-      preview.textContent = renderStyle(fields.prompt.input.value, { name: previewName.input.value, bio: previewBio.input.value, transcript: previewTranscript.input.value, notes: state.notes[chatId]?.text ?? '', memories: live(state.memories).filter(value => value.enabled).map(value => value.text).join('\n') }); };
+    const updatePreview = () => {
+      const conversation = state.conversations.find(value => value.id === selectedConversation);
+      const values = templateValues(conversation, { notes: getConversationNote(state, conversation)?.text ?? '', memories: live(state.memories).filter(value => value.enabled) });
+      preview.textContent = renderStyle(fields.prompt.input.value, { ...values, name: previewName.input.value, personName: previewName.input.value, matchName: previewName.input.value,
+        bio: previewBio.input.value, personBio: previewBio.input.value, transcript: previewTranscript.input.value }); };
     const editor = form(async () => {
       const value = { ...item, name: fields.name.input.value, prompt: fields.prompt.input.value, model: fields.model.input.value,
         temperature: Number(fields.temperature.input.value), maxTokens: Number(fields.maxTokens.input.value), suggestionCount: Number(fields.suggestionCount.input.value),
-        shared: fields.shared.input.checked, useHistory: fields.useHistory.input.checked,
+        shared: fields.shared.input.checked, useHistory: fields.useHistory.input.checked, includePhotos: fields.includePhotos.input.checked,
         conditions: conditions.filter(value => value.input.checked).map(value => value.value) };
       await mutate('save-style', { style: value });
     });
     Object.values(fields).forEach(value => editor.append(value.wrapper));
-    editor.append(node('p', '{{name}} · {{bio}} · {{transcript}} · {{notes}} · {{memories}}', 'ws-muted'));
+    editor.append(node('p', '{platform} · {datetime} · {transcript} · {accountName} · {accountBio} · {aboutAccountProfile} · {matchName} · {personName} · {matchRichFields} · {aboutPersonProfile} · {{name}} · {{bio}} · {{notes}} · {{memories}}', 'ws-muted'));
     editor.append(...conditions.map(value => value.wrapper), submit(t('Сохранить стиль', 'Save style')));
     const previewBox = node('details'); previewBox.append(node('summary', t('Предпросмотр переменных', 'Variable preview')), previewName.wrapper, previewBio.wrapper, previewTranscript.wrapper, preview);
     [fields.prompt.input, previewName.input, previewBio.input, previewTranscript.input].forEach(input => input.addEventListener('input', updatePreview));
     updatePreview(); edit.append(editor, previewBox); panel.append(edit);
   }
+  function styleCatalog() {
+    const section = node('details'); section.append(node('summary', t('Каталог стилей на моём сервере', 'Style catalog on my server')));
+    const selected = field(t('Стиль из библиотеки', 'Library style'), '', { options: [{ value: '', label: '—' }, ...live(state.styles).map(item => ({ value: item.id, label: item.name }))] });
+    const list = node('div', undefined, 'ws-list');
+    const loadCatalog = async () => {
+      const response = await raw('catalog-list'); list.replaceChildren();
+      for (const item of response.items ?? []) {
+        const entry = card(item.name); entry.append(node('pre', item.prompt, 'ws-preview'), actions(
+          button(t('В библиотеку', 'Add to library'), () => mutate('save-style', { style: item })),
+          button(t('Экспорт', 'Export'), () => download({ version: 1, styles: [item] }, 'replylab-style.json')),
+          button(t('Удалить с сервера', 'Delete from server'), async () => { if (confirm(t('Удалить стиль?', 'Delete this style?'))) { await raw('catalog-delete', { id: item.id }); await loadCatalog(); } }),
+        )); list.append(entry);
+      }
+      if (!list.children.length) list.append(node('p', t('Каталог пуст.', 'The catalog is empty.')));
+    };
+    section.append(node('p', t('Это общие стили вашей библиотеки на вашем сервере.', 'These are shared styles from your library on your server.'), 'ws-muted'), selected.wrapper,
+      actions(button(t('Получить каталог', 'Load catalog'), loadCatalog), button(t('Сохранить на сервере', 'Save on server'), async () => {
+        const style = live(state.styles).find(item => item.id === selected.input.value);
+        if (!style) throw new Error(t('Выберите стиль.', 'Choose a style.'));
+        await raw('catalog-save', { style }); await loadCatalog();
+      })), list); panel.append(section);
+  }
+  function templateCatalog() {
+    const section = node('details'); section.append(node('summary', t('Шаблоны инструкций на моём сервере', 'Prompt templates on my server')));
+    const name = field(t('Название', 'Name'), '', { required: true, maxLength: 120 });
+    const scope = field(t('Назначение шаблона', 'Template scope'), 'reply', { options: ['reply', 'assistant-base', 'assistant-chat', 'assistant-profile'] });
+    const prompt = field(t('Инструкция', 'Prompt'), '', { textarea: true, rows: 5, required: true, maxLength: 10000 });
+    const list = node('div', undefined, 'ws-list');
+    let selectedId = null;
+    const loadTemplates = async () => {
+      const response = await raw('template-list'); list.replaceChildren();
+      for (const item of response.items ?? []) {
+        const entry = card(item.name + ' · ' + item.scope);
+        entry.append(node('pre', item.prompt, 'ws-preview'), actions(
+          button(t('Редактировать', 'Edit'), () => { selectedId = item.id; name.input.value = item.name; scope.input.value = item.scope; prompt.input.value = item.prompt; name.input.focus(); }),
+          button(t('Применить к настройкам', 'Apply to settings'), async () => {
+            const current = state.settings.assistantPrompts.useCustom ? state.settings.assistantPrompts : DEFAULT_ASSISTANT_PROMPTS;
+            const settings = item.scope === 'reply' ? { systemPrompt: item.prompt } : { assistantPrompts: { ...current, useCustom: true, [item.scope.slice('assistant-'.length)]: item.prompt } };
+            await mutate('save-settings', { settings });
+          }),
+          button(t('Экспорт', 'Export'), () => download({ format: 'replylab-prompt-template', template: item }, 'replylab-template.json')),
+          button(t('Удалить с сервера', 'Delete from server'), async () => { if (confirm(t('Удалить шаблон?', 'Delete this template?'))) { await raw('template-delete', { id: item.id }); await loadTemplates(); } }),
+        )); list.append(entry);
+      }
+      if (!list.children.length) list.append(node('p', t('Каталог пуст.', 'The catalog is empty.')));
+    };
+    const editor = form(async () => {
+      await raw('template-save', { ...(selectedId ? { id: selectedId } : {}), template: { name: name.input.value, scope: scope.input.value, prompt: prompt.input.value } }); await loadTemplates();
+    });
+    editor.append(name.wrapper, scope.wrapper, prompt.wrapper, actions(submit(t('Сохранить на сервере', 'Save on server')),
+      button(t('Новый шаблон', 'New template'), () => { selectedId = null; name.input.value = ''; prompt.input.value = ''; }), button(t('Получить каталог', 'Load catalog'), loadTemplates)));
+    const file = field(t('Импорт шаблона JSON', 'Import template JSON'), '', { type: 'file', accept: '.json,application/json' });
+    section.append(editor, file.wrapper, button(t('Открыть импорт для проверки', 'Preview import'), async () => {
+      const source = file.input.files[0]; if (!source || source.size > 50000) throw new Error(t('Выберите JSON до 50 КБ.', 'Choose JSON up to 50 KB.'));
+      const parsed = JSON.parse(await source.text()); const item = parsed.template;
+      if (parsed.format !== 'replylab-prompt-template' || !item || typeof item.name !== 'string' || typeof item.prompt !== 'string'
+        || !['reply', 'assistant-base', 'assistant-chat', 'assistant-profile'].includes(item.scope) || item.prompt.length > 10000 || item.name.length > 120) throw new Error(t('Некорректный шаблон.', 'Invalid template.'));
+      selectedId = null; name.input.value = item.name; prompt.input.value = item.prompt; scope.input.value = item.scope;
+    }), list); panel.append(section);
+  }
+  function conversationLabel(item) {
+    return [item.title || item.chatId, item.platform, item.accountId || (item.accountScope ? item.accountScope + ' · ' + t('Аккаунт не проверен', 'Unverified account') : '—')].join(' · ');
+  }
+  function draftActions(text, conversationId) {
+    const conversation = live(state.conversations).find(item => item.id === conversationId);
+    const row = actions(button(t('Копировать', 'Copy'), () => navigator.clipboard.writeText(text)));
+    if (conversation) {
+      if (conversation.accountId) row.append(button(t('Вставить в открытый чат', 'Insert into open chat'), async () => {
+        const response = await raw('insert-draft', { conversationId: conversation.id, text });
+        say(response.pendingConfirmation ? t('Подтвердите замену черновика на странице чата.', 'Confirm draft replacement on the chat page.') : t('Черновик передан в открытый чат.', 'Draft passed to the open chat.'));
+      }));
+      row.append(button(t('Открыть чат', 'Open chat'), () => raw('open-conversation', { conversationId: conversation.id })));
+    }
+    return row;
+  }
+  function toolCards(entry, message) {
+    for (const tool of message.toolResults ?? []) {
+      const box = node('section', undefined, 'ws-tool-card');
+      if (tool.type === 'suggestions') {
+        box.append(node('h4', t('Варианты ответа', 'Reply suggestions')));
+        for (const reply of tool.replies) {
+          const suggestion = node('div', undefined, 'ws-card');
+          suggestion.append(node('p', reply.text));
+          if (reply.reason) suggestion.append(node('p', reply.reason, 'ws-muted'));
+          suggestion.append(draftActions(reply.text, message.conversationId)); box.append(suggestion);
+        }
+      } else if (tool.type === 'draft-style') {
+        box.append(node('h4', t('Черновик стиля требует подтверждения', 'Style draft requires confirmation')), node('strong', tool.style.name), node('pre', tool.style.prompt, 'ws-preview'));
+        box.append(button(t('Открыть черновик в редакторе', 'Open draft in editor'), () => {
+          selectedStyle = null; tab = 'styles'; render(); stylesEditor({ ...tool.style });
+          say(t('Проверьте инструкцию и нажмите Сохранить стиль.', 'Review the prompt and choose Save style.'));
+        }));
+      } else if (tool.type === 'past-replies') {
+        box.append(node('h4', t('Мои прошлые ответы', 'My previous replies')), node('p', tool.query, 'ws-muted'));
+        if (tool.error) box.append(node('p', tool.error.message, 'ws-error'));
+        else if (!tool.results.length) box.append(node('p', t('Совпадений в разрешённой истории нет.', 'No matches in the approved history.')));
+        for (const hit of tool.results) {
+          const result = node('div', undefined, 'ws-card');
+          result.append(node('small', [hit.platform, hit.accountId || '—', hit.sentAt || t('Время неизвестно', 'Time unknown')].join(' · ')), node('p', hit.theirText, 'ws-muted'), node('p', hit.myReply),
+            actions(button(t('Копировать', 'Copy'), () => navigator.clipboard.writeText(hit.myReply)),
+              button(t('Открыть чат', 'Open chat'), () => raw('open-conversation', { conversation: { platform: hit.platform, accountId: hit.accountId, chatId: hit.chatId }, conversationId: hit.conversationId }))));
+          if (hit.partial) result.append(node('small', t('Частичный снимок', 'Partial capture')));
+          box.append(result);
+        }
+      }
+      entry.append(box);
+    }
+  }
+  async function forkAssistant(chat, message, text) {
+    const previous = new Set(state.assistantChats.map(item => item.id));
+    await mutate('fork-chat', { sourceId: chat.id, messageId: message.id, ...(text === undefined ? {} : { text }) }, false);
+    const fork = live(state.assistantChats).find(item => !previous.has(item.id));
+    if (!fork) throw new Error('Forked chat is unavailable.');
+    selectedChat = fork.id; selectedConversation = fork.contextId || null; attachmentOwner = null; tab = 'assistant'; render();
+  }
+  function editAssistant(chat, message) {
+    const dialog = node('dialog', undefined, 'ws-dialog');
+    const value = field(t('Изменённый запрос', 'Edited request'), message.text, { textarea: true, rows: 7, maxLength: 10000, required: true });
+    const editor = form(async () => { await forkAssistant(chat, message, value.input.value); dialog.close(); });
+    editor.append(node('h3', t('Продолжить в новой ветке', 'Continue in a new branch')),
+      node('p', t('Исходный диалог сохранится. Перед отправкой можно проверить запрос.', 'The original chat is preserved. Review the request before sending.')), value.wrapper,
+      actions(submit(t('Создать ветку', 'Create branch')), button(t('Отменить', 'Cancel'), () => dialog.close())));
+    dialog.append(editor); dialog.addEventListener('close', () => dialog.remove(), { once: true }); app.append(dialog); dialog.showModal(); value.input.focus();
+  }
   function assistantPage() {
     const chats = live(state.assistantChats), chat = chats.find(item => item.id === selectedChat) ?? chats[0];
-    if (chat) selectedChat = chat.id;
+    if (chat) {
+      selectedChat = chat.id;
+      if (attachmentOwner !== chat.id) { attachments = structuredClone(chat.draftAttachments ?? []); attachmentOwner = chat.id; }
+    }
     panel.append(actions(button(t('Новый диалог', 'New chat'), async () => {
-      const fresh = { id: uuid(), title: t('Новый диалог', 'New chat'), model: state.settings.assistantModel, messages: [] };
-      attachments = []; selectedChat = fresh.id; await mutate('save-chat', { chat: fresh });
+      const fresh = { id: uuid(), title: t('Новый диалог', 'New chat'), model: state.settings.assistantModel, messages: [], contextId: selectedConversation || '' };
+      attachments = []; selectedChat = fresh.id; attachmentOwner = fresh.id; await mutate('save-chat', { chat: fresh });
     })));
     const selection = field(t('Диалог (до 20)', 'Chat (up to 20)'), chat?.id ?? '', { options: chats.map(item => ({ value: item.id, label: item.title })) });
-    selection.input.addEventListener('change', () => { attachments = []; selectedChat = selection.input.value; render(); }); panel.append(selection.wrapper);
+    selection.input.addEventListener('change', () => { selectedChat = selection.input.value; selectedConversation = chats.find(item => item.id === selectedChat)?.contextId || null; render(); }); panel.append(selection.wrapper);
     if (!chat) { panel.append(node('p', t('Создайте первый диалог.', 'Create your first chat.'))); return; }
     const titleField = field(t('Название диалога', 'Chat title'), chat.title, { maxLength: 150 });
-    titleField.input.addEventListener('change', () => mutate('save-chat', { chat: { ...chat, title: titleField.input.value } }).catch(error => say(error.message, true)));
+    titleField.input.addEventListener('change', () => mutate('save-chat', { chat: { ...chat, title: titleField.input.value } }, false).catch(error => say(error.message, true)));
     panel.append(titleField.wrapper, node('p', chat.messages.length + '/40 ' + t('сообщений. Перед удалением экспортируйте историю.', 'messages. Export history before deletion.'), 'ws-muted'));
     const messages = node('div', undefined, 'ws-list');
     for (const message of chat.messages) {
       const entry = node('div', undefined, 'ws-message ' + message.role);
-      entry.append(node('small', message.role), node('p', message.text));
+      entry.append(node('small', message.role));
+      if (message.text) entry.append(node('p', message.text));
       for (const file of message.attachments ?? []) entry.append(node('small', file.name + ' · ' + file.mimeType));
+      toolCards(entry, message);
+      if (message.incomplete) entry.append(node('p', t('Достигнут лимит шагов инструментов. Показаны полученные результаты.', 'Tool step limit reached. Available results are shown.'), 'ws-muted'));
+      if (message.role === 'user') entry.append(button(t('Изменить в новой ветке', 'Edit in a new branch'), () => editAssistant(chat, message)));
+      if (message.role === 'assistant') {
+        if (message.text) entry.append(draftActions(message.text, message.conversationId));
+        entry.append(button(t('Повторить в новой ветке', 'Regenerate in a new branch'), () => forkAssistant(chat, message)));
+      }
       messages.append(entry);
     }
     panel.append(messages);
-    const context = field(t('Контекст из сохранённого чата', 'Saved conversation context'), selectedConversation ?? '', { options: [{ value: '', label: '—' }, ...live(state.conversations).map(item => ({ value: item.id, label: item.title || item.chatId }))] });
-    context.input.addEventListener('change', () => { selectedConversation = context.input.value; });
-    const input = field(t('Сообщение (до 10 000 символов)', 'Message (up to 10,000 characters)'), '', { textarea: true, rows: 4, maxLength: 10000, required: true });
+    const context = field(t('Контекст из сохранённого чата', 'Saved conversation context'), selectedConversation ?? chat.contextId ?? '', { options: [{ value: '', label: '—' }, ...live(state.conversations).map(item => ({ value: item.id, label: conversationLabel(item) }))] });
+    context.input.addEventListener('change', () => { selectedConversation = context.input.value || null; });
+    const contextKind = field(t('Объект анализа', 'Analysis context'), chat.contextKind, { options: [
+      { value: 'chat', label: t('Переписка', 'Conversation') }, { value: 'profile', label: t('Мой профиль аккаунта', 'My account profile') },
+    ] });
+    const task = field(t('Задача', 'Task'), chat.draftTask ?? 'assistant', { options: [
+      { value: 'assistant', label: t('AI-помощник', 'AI assistant') }, { value: 'translate', label: t('Перевести', 'Translate') },
+      { value: 'summarize', label: t('Резюме', 'Summarize') }, { value: 'create-style', label: t('Создать стиль', 'Create style') },
+    ] });
+    const allowHistory = field(t('Разрешить поиск моих прошлых ответов для этого запроса', 'Allow searching my previous replies for this request'), false, { type: 'checkbox' });
+    const allAccounts = field(t('Включить историю всех моих аккаунтов', 'Include history from all my accounts'), false, { type: 'checkbox' }); allAccounts.input.disabled = true;
+    allowHistory.input.addEventListener('change', () => { allAccounts.input.disabled = !allowHistory.input.checked; if (!allowHistory.input.checked) allAccounts.input.checked = false; });
+    const input = field(t('Сообщение (до 10 000 символов)', 'Message (up to 10,000 characters)'), chat.draft, { textarea: true, rows: 4, maxLength: 10000, required: true });
     const files = field(t('Вложения: до 4 файлов, 1 МБ каждый; изображения или текст', 'Attachments: up to 4 files, 1 MB each; images or text'), '', { type: 'file', accept: 'image/png,image/jpeg,image/webp,image/gif,text/plain,text/markdown,.md,.txt', multiple: true });
-    const fileList = node('div', '', 'ws-muted');
+    const fileList = node('div', attachments.map(file => file.name).join(', '), 'ws-muted');
     files.input.addEventListener('change', async () => {
       try {
         const selected = [...files.input.files];
@@ -247,49 +398,56 @@ export async function mountWorkspace(container, { rpc, stream }) {
           return { name: file.name, mimeType: 'text/plain', text: await file.text() };
         }));
         fileList.textContent = attachments.map(file => file.name).join(', ');
-      } catch (error) { attachments = []; files.input.value = ''; say(error.message, true); }
+      } catch (error) { attachments = []; files.input.value = ''; fileList.textContent = ''; say(error.message, true); }
     });
     const send = async operation => {
       if (assistantSending) throw new Error(t('Дождитесь ответа помощника.', 'Wait for the assistant response.'));
       if (!input.input.value.trim()) throw new Error(t('Введите сообщение.', 'Enter a message.'));
       if (chat.messages.length > 38) throw new Error(t('Лимит 40 сообщений. Экспортируйте и начните новый диалог.', '40-message limit reached. Export and start a new chat.'));
+      const conversation = live(state.conversations).find(item => item.id === context.input.value);
+      if (contextKind.input.value === 'profile' && !conversation?.accountProfile) throw new Error(t('Выберите диалог с сохранённым профилем владельца аккаунта.', 'Choose a conversation with a captured account owner profile.'));
       assistantSending = true;
       try {
-      const instruction = operation === 'translate' ? 'Translate the following text to ' + state.settings.language + ':\n' : operation === 'summarize' ? 'Summarize the following conversation:\n' : operation === 'style' ? 'Write a reusable reply style instruction from:\n' : '';
-      if ((instruction + input.input.value).length > 10000) throw new Error(t('Сократите сообщение: вместе с инструкцией лимит 10 000 символов.', 'Shorten the message: the instruction and message must fit 10,000 characters.'));
-      const userMessage = { id: uuid(), role: 'user', text: instruction + input.input.value, attachments, createdAt: iso() };
-      const pendingChat = { ...chat, model: state.settings.assistantModel || chat.model, messages: [...chat.messages, userMessage] };
-      await mutate('save-chat', { chat: pendingChat }, false);
-      const conversation = live(state.conversations).find(item => item.id === context.input.value);
-      say(t('Готовим ответ…', 'Generating…'));
-      const payload = { messages: pendingChat.messages, context: conversation ?? null, model: pendingChat.model,
-        systemPrompt: state.settings.systemPrompt, memories: live(state.memories).filter(item => item.enabled).map(item => item.text), notes: state.notes[conversation?.chatId]?.text ?? '' };
-      assistantController = new AbortController();
-      const preview = node('div', '', 'ws-message assistant');
-      preview.setAttribute('aria-live', 'polite');
-      const cancel = button(t('Остановить генерацию', 'Stop generation'), () => assistantController?.abort());
-      panel.append(preview, cancel);
-      let response;
-      try {
-        response = stream ? await stream('assistant', payload, {
-          signal: assistantController.signal,
-          onDelta: delta => { preview.textContent += typeof delta === 'string' ? delta : delta?.text ?? ''; },
-        }) : await raw('assistant', payload);
-      } finally { cancel.remove(); }
-      if (response?.ok === false) throw new Error(response.error || 'Generation failed');
-      const answer = response.text ?? response.answer ?? response.response?.text;
-      if (typeof answer !== 'string' || !answer.trim()) throw new Error(t('Пустой ответ помощника.', 'The assistant returned an empty response.'));
-      await mutate('save-chat', { chat: { ...pendingChat, messages: [...pendingChat.messages, { id: uuid(), role: 'assistant', text: answer, createdAt: iso() }] } });
-      attachments = [];
-      if (operation === 'style') await mutate('save-style', { style: { name: t('Из AI-помощника', 'From AI assistant'), prompt: answer } });
-      } finally { assistantSending = false; assistantController = null; }
+        await flushNotes();
+        const userMessage = { id: uuid(), role: 'user', text: input.input.value, attachments: structuredClone(attachments), createdAt: iso(), task: operation,
+          conversationId: conversation?.id ?? '', contextKind: contextKind.input.value };
+        const pendingChat = { ...chat, model: state.settings.assistantModel || chat.model, messages: [...chat.messages, userMessage], draft: '', draftAttachments: [],
+          draftTask: operation, contextId: conversation?.id ?? '', contextKind: contextKind.input.value };
+        await mutate('save-chat', { chat: pendingChat }, false);
+        attachments = [];
+        say(t('Готовим ответ…', 'Generating…'));
+        const payload = { messages: pendingChat.messages, context: conversation ?? null, contextKind: contextKind.input.value, model: pendingChat.model,
+          allowHistorySearch: allowHistory.input.checked, allowAllAccountsHistory: allowHistory.input.checked && allAccounts.input.checked,
+          memories: live(state.memories).filter(item => item.enabled).map(item => item.text), notes: getConversationNote(state, conversation)?.text ?? '' };
+        assistantController = new AbortController();
+        const preview = node('div', '', 'ws-message assistant'); preview.setAttribute('aria-live', 'polite');
+        const cancel = button(t('Остановить генерацию', 'Stop generation'), () => assistantController?.abort()); panel.append(preview, cancel);
+        let response;
+        try {
+          response = stream ? await stream(operation, payload, { signal: assistantController.signal,
+            onDelta: delta => { preview.textContent += typeof delta === 'string' ? delta : delta?.text ?? ''; },
+          }) : await raw(operation, payload);
+        } finally { cancel.remove(); }
+        if (response?.ok === false) throw new Error(response.error || 'Generation failed');
+        const answer = response.text ?? response.answer ?? response.response?.text ?? '';
+        const toolResults = [...(response.toolResults ?? [])];
+        if (response.style && !toolResults.some(item => item.type === 'draft-style')) toolResults.push({ type: 'draft-style', style: {
+          name: response.style.name ?? t('Из AI-помощника', 'From AI assistant'), prompt: response.style.prompt, useHistory: response.style.useHistory ?? false,
+        }, requiresConfirmation: true });
+        if (response.replies?.length && !toolResults.some(item => item.type === 'suggestions')) toolResults.push({ type: 'suggestions', replies: response.replies.map(item => typeof item === 'string' ? { text: item, reason: '' } : { text: item.text, reason: item.reason ?? '' }) });
+        if (typeof answer !== 'string' || !answer.trim() && !toolResults.length) throw new Error(t('Пустой ответ помощника.', 'The assistant returned an empty response.'));
+        await mutate('save-chat', { chat: { ...pendingChat, messages: [...pendingChat.messages, { id: uuid(), role: 'assistant', text: answer, toolResults,
+          createdAt: iso(), task: operation, conversationId: conversation?.id ?? '', contextKind: contextKind.input.value,
+          ...(response.incomplete ? { incomplete: true, finishReason: response.finishReason ?? 'tool-limit' } : {}) }] } });
+      } catch (error) { render(); throw error; }
+      finally { assistantSending = false; assistantController = null; }
     };
-    const composer = form(() => send('chat'));
+    const composer = form(() => send(task.input.value));
     input.input.addEventListener('keydown', event => {
       if (state.settings.sendOnEnter && event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); composer.requestSubmit(); }
     });
-    composer.append(context.wrapper, input.wrapper, files.wrapper, fileList, submit(t('Отправить помощнику', 'Send to assistant')),
-      actions(button(t('Перевести', 'Translate'), () => send('translate')), button(t('Резюме', 'Summarize'), () => send('summarize')), button(t('Создать стиль', 'Create style'), () => send('style'))));
+    composer.append(context.wrapper, contextKind.wrapper, task.wrapper, allowHistory.wrapper, allAccounts.wrapper, input.wrapper, files.wrapper, fileList, submit(t('Отправить помощнику', 'Send to assistant')),
+      actions(button(t('Перевести', 'Translate'), () => send('translate')), button(t('Резюме', 'Summarize'), () => send('summarize')), button(t('Создать стиль', 'Create style'), () => send('create-style'))));
     panel.append(composer, button(t('Удалить диалог', 'Delete chat'), () => { if (confirm(t('Удалить AI-диалог?', 'Delete this AI chat?'))) return mutate('delete-chat', { id: chat.id }); }));
   }
   function historyPage() {
@@ -297,22 +455,23 @@ export async function mountWorkspace(container, { rpc, stream }) {
     const results = node('div', undefined, 'ws-list');
     const renderResults = () => {
       const query = search.input.value.trim().toLocaleLowerCase();
-      const matches = live(state.conversations).filter(item => JSON.stringify([item.title, item.profile, item.messages, state.notes[item.chatId]]).toLocaleLowerCase().includes(query));
+      const matches = live(state.conversations).filter(item => JSON.stringify([item.title, item.profile, item.messages, getConversationNote(state, item)]).toLocaleLowerCase().includes(query));
       results.replaceChildren();
       for (const item of matches) {
-        const entry = card(item.title || item.chatId);
+        const entry = card(conversationLabel(item));
         entry.append(node('p', item.platform + ' · ' + item.messages.length + ' ' + t('сообщений', 'messages') + (item.partial ? ' · ' + t('частичный снимок', 'partial capture') : ''), 'ws-muted'));
         const show = node('details'); show.append(node('summary', t('Показать переписку', 'Show conversation')));
         for (const message of item.messages) show.append(node('p', message.role + ': ' + message.text, 'ws-message'));
-        const note = field(t('Заметка к диалогу (автосохранение)', 'Conversation note (autosave)'), state.notes[item.chatId]?.text ?? '', { textarea: true, rows: 3, maxLength: 30000 });
+        const noteKey = getNoteKey(item);
+        const note = field(t('Заметка к диалогу (автосохранение)', 'Conversation note (autosave)'), pendingNotes.get(noteKey)?.text ?? getConversationNote(state, item)?.text ?? '', { textarea: true, rows: 3, maxLength: 30000 });
         note.input.addEventListener('input', () => {
-          const old = pendingNotes.get(item.chatId); clearTimeout(old?.timer);
-          pendingNotes.set(item.chatId, { text: note.input.value, timer: setTimeout(() => saveNote(item.chatId).catch(error => say(error.message, true)), 500) });
+          const old = pendingNotes.get(noteKey); clearTimeout(old?.timer);
+          pendingNotes.set(noteKey, { conversation: item, text: note.input.value, timer: setTimeout(() => saveNote(noteKey).catch(error => say(error.message, true)), 500) });
         });
         const ttl = field(t('Ссылка: срок в часах', 'Share link: hours'), 24, { type: 'number', min: 1, max: 168 });
         const linkBox = node('div', '', 'ws-muted');
         entry.append(show, note.wrapper, ttl.wrapper, linkBox, actions(
-          button(t('Экспорт чата', 'Export chat'), async () => { await saveNote(item.chatId); download({ version: 1, conversations: [item], notes: { [item.chatId]: state.notes[item.chatId] ?? { text: '', updatedAt: iso() } } }, 'replylab-conversation.json'); }),
+          button(t('Экспорт чата', 'Export chat'), async () => { await saveNote(noteKey); download({ version: 1, conversations: [item], notes: { [noteKey]: getConversationNote(state, item) ?? { text: '', updatedAt: iso() } } }, 'replylab-conversation.json'); }),
           button(t('Создать ссылку', 'Create link'), async () => {
             const response = await raw('share', { conversation: item, ttlSeconds: Number(ttl.input.value) * 3600 });
             if (!response.url) throw new Error('Share URL is unavailable.');
@@ -320,6 +479,7 @@ export async function mountWorkspace(container, { rpc, stream }) {
             linkBox.replaceChildren(anchor, button(t('Отозвать', 'Revoke'), async () => { await raw('revoke-share', { id: response.id }); linkBox.textContent = t('Ссылка отозвана.', 'Link revoked.'); }));
           }),
           button(t('Использовать в помощнике', 'Use in assistant'), () => { selectedConversation = item.id; tab = 'assistant'; render(); }),
+          button(t('Открыть чат', 'Open chat'), () => raw('open-conversation', { conversationId: item.id })),
         )); results.append(entry);
       }
       if (!matches.length) results.append(node('p', t('Диалоги ещё не сохранены или ничего не найдено.', 'No conversations saved or no matches.')));
@@ -342,11 +502,11 @@ export async function mountWorkspace(container, { rpc, stream }) {
       await mutate('import', { data, mode: replace.input.checked ? 'replace' : 'merge', confirmReplace: replace.input.checked });
     }));
   }
-  async function saveNote(chatId) {
-    const pending = pendingNotes.get(chatId); if (!pending) return;
-    clearTimeout(pending.timer); pendingNotes.delete(chatId);
-    try { await mutate('save-note', { chatId, text: pending.text }, false); }
-    catch (error) { if (!pendingNotes.has(chatId)) pendingNotes.set(chatId, { text: pending.text, timer: null }); throw error; }
+  async function saveNote(noteKey) {
+    const pending = pendingNotes.get(noteKey); if (!pending) return;
+    clearTimeout(pending.timer); pendingNotes.delete(noteKey);
+    try { await mutate('save-note', { conversationId: pending.conversation.id, conversation: pending.conversation, text: pending.text }, false); }
+    catch (error) { if (!pendingNotes.has(noteKey)) pendingNotes.set(noteKey, { ...pending, timer: null }); throw error; }
   }
   async function flushNotes() {
     for (const chatId of [...pendingNotes.keys()]) await saveNote(chatId);
@@ -426,6 +586,12 @@ export async function mountWorkspace(container, { rpc, stream }) {
     panel.append(node('h3', t('Очередь запланированных ответов', 'Scheduled replies')));
     const chat = field(t('ID диалога', 'Conversation ID'), '', { required: true, maxLength: 200 });
     const platform = field(t('Платформа', 'Platform'), 'manual', { options: ['manual', 'tinder', 'whatsapp'] });
+    const account = field(t('ID аккаунта', 'Account ID'), '', { maxLength: 200 });
+    const saved = field(t('Контекст из сохранённого чата', 'Saved conversation context'), '', { options: [{ value: '', label: '—' }, ...live(state.conversations).map(item => ({ value: item.id, label: conversationLabel(item) }))] });
+    saved.input.addEventListener('change', () => {
+      const item = live(state.conversations).find(item => item.id === saved.input.value);
+      if (item) { chat.input.value = item.chatId; platform.input.value = item.platform; account.input.value = item.accountId; }
+    });
     const body = field(t('Текст ответа', 'Reply text'), '', { textarea: true, rows: 3, required: true, maxLength: 10000 });
     const when = field(t('Когда', 'When'), '', { type: 'datetime-local', required: true });
     const automatic = field(t('Автоматическое выполнение (требует отдельного включения в настройках)', 'Automatic execution (requires enabling in settings)'), false, { type: 'checkbox' });
@@ -435,22 +601,24 @@ export async function mountWorkspace(container, { rpc, stream }) {
     const editor = form(async () => {
       const fireAt = new Date(when.input.value);
       if (!Number.isFinite(fireAt.getTime()) || fireAt.getTime() <= Date.now()) throw new Error(t('Выберите время в будущем.', 'Choose a future time.'));
-      const captured = live(state.conversations).find(item => item.chatId === chat.input.value && item.platform === platform.input.value);
+      const candidates = live(state.conversations).filter(item => item.chatId === chat.input.value && item.platform === platform.input.value && item.accountId === account.input.value);
+      const captured = candidates.find(item => item.id === saved.input.value) ?? (candidates.length === 1 ? candidates[0] : null);
       if (automatic.input.checked && !captured) throw new Error(t('Для автоматического режима сначала сохраните диалог или создайте запись в панели чата.', 'For automatic mode, save the conversation first or schedule from the chat panel.'));
       if (automatic.input.checked && !captured?.accountId) throw new Error(t('Для автоматического режима нужен проверенный аккаунт. Создайте запись в открытом чате.', 'Automatic mode requires a verified account. Schedule from the open chat.'));
-      await mutate('schedule', { item: { chatId: chat.input.value, platform: platform.input.value, text: body.input.value, fireAt: fireAt.toISOString(),
+      await mutate('schedule', { item: { chatId: chat.input.value, accountId: account.input.value, accountScope: captured?.accountScope ?? '', platform: platform.input.value, text: body.input.value, fireAt: fireAt.toISOString(),
         sendMode: automatic.input.checked ? 'automatic' : 'review', incomingSnapshot: captured ? incomingSnapshot(captured) : '',
         variationSeconds: Number(variation.input.value), skipIfNewMessage: skip.input.checked } });
     });
     const tomorrow = () => { const date = new Date(); date.setDate(date.getDate() + 1); date.setHours(9, 0, 0, 0); return date; };
-    editor.append(chat.wrapper, platform.wrapper, body.wrapper, when.wrapper, actions(
+    editor.append(saved.wrapper, chat.wrapper, platform.wrapper, account.wrapper, body.wrapper, when.wrapper, actions(
       button(t('Через час', 'In one hour'), () => { when.input.value = localDateTime(Date.now() + 3600000); }),
       button(t('Завтра в 09:00', 'Tomorrow at 09:00'), () => { when.input.value = localDateTime(tomorrow()); }),
     ), variation.wrapper, skip.wrapper, automatic.wrapper, submit(t('Запланировать', 'Schedule'))); panel.append(editor);
     for (const item of live(state.schedules).sort((a, b) => a.fireAt.localeCompare(b.fireAt))) {
-      const entry = card(item.chatId + ' · ' + item.status); entry.append(node('p', new Date(item.fireAt).toLocaleString() + ' · ' + item.sendMode + ' · ±' + item.variationSeconds + 's', 'ws-muted'), node('p', item.text));
+      const entry = card(conversationLabel(item) + ' · ' + item.status); entry.append(node('p', new Date(item.fireAt).toLocaleString() + ' · ' + item.sendMode + ' · ±' + item.variationSeconds + 's', 'ws-muted'), node('p', item.text));
       const time = field(t('Новое время', 'New time'), localDateTime(item.fireAt), { type: 'datetime-local' });
-      entry.append(time.wrapper, actions(button(t('Перенести', 'Reschedule'), () => mutate('reschedule', { id: item.id, fireAt: new Date(time.input.value).toISOString() })), button(t('Отменить', 'Cancel'), () => mutate('cancel-schedule', { id: item.id }))));
+      entry.append(time.wrapper, actions(button(t('Перенести', 'Reschedule'), () => mutate('reschedule', { id: item.id, fireAt: new Date(time.input.value).toISOString() })), button(t('Отменить', 'Cancel'), () => mutate('cancel-schedule', { id: item.id })),
+        button(t('Открыть чат', 'Open chat'), () => raw('open-conversation', { conversation: { platform: item.platform, accountId: item.accountId, accountScope: item.accountScope, chatId: item.chatId } }))));
       if (item.error) entry.append(node('p', item.error, 'ws-muted')); panel.append(entry);
     }
   }
@@ -464,6 +632,7 @@ export async function mountWorkspace(container, { rpc, stream }) {
     }
     const fields = {
       language: field(t('Язык', 'Language'), settings.language, { options: Object.entries(LANGUAGES).map(([value, label]) => ({ value, label })) }),
+      replyLanguage: field(t('Язык ответов AI', 'AI response language'), settings.replyLanguage, { options: [{ value: 'auto', label: t('Автоматически по контексту', 'Automatic from context') }, ...Object.entries(LANGUAGES).map(([value, label]) => ({ value, label }))] }),
       provider: field(t('Провайдер', 'Provider'), settings.provider, { options: ['openai', 'openrouter', 'compatible', 'chatgpt'] }),
       suggestionProvider: field(t('Провайдер подсказок', 'Suggestion provider'), settings.suggestionProvider, { options: [{ value: '', label: t('Наследовать общий', 'Inherit main provider') }, ...['openai', 'openrouter', 'compatible', 'chatgpt']] }),
       assistantProvider: field(t('Провайдер помощника', 'Assistant provider'), settings.assistantProvider, { options: [{ value: '', label: t('Наследовать общий', 'Inherit main provider') }, ...['openai', 'openrouter', 'compatible', 'chatgpt']] }),
@@ -488,13 +657,29 @@ export async function mountWorkspace(container, { rpc, stream }) {
       longitude: field(t('Долгота', 'Longitude'), settings.geo.longitude, { type: 'number', min: -180, max: 180, step: 'any' }),
       accuracy: field(t('Точность, м', 'Accuracy, m'), settings.geo.accuracy, { type: 'number', min: 0, max: 100000 }),
     };
+    const custom = field(t('Использовать свои инструкции помощника', 'Use custom assistant prompts'), settings.assistantPrompts.useCustom, { type: 'checkbox' });
+    const promptSource = settings.assistantPrompts.useCustom ? settings.assistantPrompts : DEFAULT_ASSISTANT_PROMPTS;
+    const promptFields = {
+      base: field(t('Базовая инструкция помощника', 'Base assistant prompt'), promptSource.base, { textarea: true, rows: 4, maxLength: 10000 }),
+      chat: field(t('Инструкция для переписки', 'Conversation assistant prompt'), promptSource.chat, { textarea: true, rows: 4, maxLength: 10000 }),
+      profile: field(t('Инструкция для моего профиля', 'My profile assistant prompt'), promptSource.profile, { textarea: true, rows: 4, maxLength: 10000 }),
+    };
+    const promptPreview = node('pre', '', 'ws-preview');
+    const previewKind = field(t('Объект анализа', 'Analysis context'), 'chat', { options: [{ value: 'chat', label: t('Переписка', 'Conversation') }, { value: 'profile', label: t('Мой профиль аккаунта', 'My account profile') }] });
+    const configuredPrompts = () => ({ useCustom: custom.input.checked, ...Object.fromEntries(Object.entries(promptFields).map(([key, value]) => [key, value.input.value])) });
+    const updatePromptPreview = () => { promptPreview.textContent = assistantPrompt({ assistantPrompts: configuredPrompts() }, previewKind.input.value); };
+    const prompts = node('details'); prompts.append(node('summary', t('Инструкции AI-помощника', 'AI assistant prompts')), custom.wrapper, ...Object.values(promptFields).map(item => item.wrapper),
+      button(t('Сбросить поля к стандартным', 'Reset fields to defaults'), () => { custom.input.checked = false; for (const [key, value] of Object.entries(promptFields)) value.input.value = DEFAULT_ASSISTANT_PROMPTS[key]; updatePromptPreview(); }), previewKind.wrapper, promptPreview);
+    [custom.input, previewKind.input, ...Object.values(promptFields).map(item => item.input)].forEach(input => input.addEventListener('input', updatePromptPreview)); updatePromptPreview();
     const editor = form(async () => {
       const next = Object.fromEntries(Object.entries(fields).filter(([key]) => !['geoEnabled', 'latitude', 'longitude', 'accuracy'].includes(key)).map(([key, value]) => [key, value.input.type === 'checkbox' ? value.input.checked : key === 'suggestionCount' ? Number(value.input.value) : value.input.value]));
       next.geo = { enabled: fields.geoEnabled.input.checked, latitude: Number(fields.latitude.input.value), longitude: Number(fields.longitude.input.value), accuracy: Number(fields.accuracy.input.value) };
+      next.assistantPrompts = configuredPrompts();
       if (next.autoSendEnabled && !settings.autoSendEnabled && !confirm(t('Включить автоматическую отправку для записей с режимом automatic?', 'Enable automatic sending for items explicitly marked automatic?'))) return;
       await mutate('save-settings', { settings: next });
     });
-    Object.values(fields).forEach(value => editor.append(value.wrapper)); editor.append(submit(t('Сохранить настройки', 'Save settings'))); panel.append(editor);
+    Object.values(fields).forEach(value => editor.append(value.wrapper)); editor.append(prompts, submit(t('Сохранить настройки', 'Save settings'))); panel.append(editor);
+    templateCatalog();
     panel.append(node('p', t('Интерфейс доступен на 11 языках.', 'The interface is available in 11 languages.'), 'ws-muted'));
     const models = node('pre', '', 'ws-preview'), serverStatus = node('pre', '', 'ws-preview'), usage = node('pre', '', 'ws-preview');
     panel.append(actions(

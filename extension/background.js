@@ -1,16 +1,17 @@
 import { generateTask } from './generation.js';
 import { allowedSender } from './messaging.js';
-import { createLibrary } from './library.js';
+import { createLibrary, PROFILE_FIELDS, normalizeStoredProfile, getConversationKey } from './library.js';
 import { serverRequest, serverOrigin, permissionFor } from './server-client.js';
 
 const library = createLibrary(chrome.storage.local);
-const PAGE_ACTIONS = new Set(['library', 'capture', 'save-note', 'record-event', 'schedule', 'reschedule', 'cancel-schedule', 'complete-schedule', 'claim-schedule', 'translate', 'save-settings']);
-const LOCAL_ACTIONS = new Set(['library', 'export', 'save-style', 'delete-style', 'duplicate-style', 'save-note', 'save-memory', 'delete-memory', 'save-settings', 'save-chat', 'delete-chat', 'capture', 'record-event', 'schedule', 'reschedule', 'cancel-schedule', 'complete-schedule', 'claim-schedule', 'import']);
+const PAGE_ACTIONS = new Set(['library', 'capture', 'save-note', 'append-note', 'record-event', 'schedule', 'reschedule', 'cancel-schedule', 'complete-schedule', 'claim-schedule', 'translate', 'save-settings', 'open-conversation']);
+const LOCAL_ACTIONS = new Set(['library', 'export', 'save-style', 'delete-style', 'duplicate-style', 'save-note', 'append-note', 'save-memory', 'delete-memory', 'save-settings', 'save-chat', 'fork-chat', 'delete-chat', 'capture', 'record-event', 'schedule', 'reschedule', 'cancel-schedule', 'complete-schedule', 'claim-schedule', 'import']);
 const AI_ACTIONS = new Set(['replies', 'assistant', 'translate', 'summarize', 'create-style']);
 const STREAMS = new Map();
 const SYNC_ALARM = 'replylab:sync';
 const ownPage = sender => { try { const url = new URL(sender.url); return sender.id === chrome.runtime.id && url.protocol === 'chrome-extension:' && url.hostname === chrome.runtime.id; } catch { return false; } };
 const safeError = error => error?.message === 'Failed to fetch' ? 'Сервер недоступен. Проверьте адрес и запустите свой сервер.' : error?.message || 'Действие не выполнено.';
+const failure = error => ({ ok: false, error: safeError(error), ...(['length', 'content-filter', 'auth', 'rate-limit', 'upstream', 'incomplete', 'invalid-output'].includes(error?.code) ? { code: error.code, retryable: error.retryable === true } : {}) });
 
 async function checkSitePermission(sender) {
   if (!ownPage(sender) && new URL(sender.url).origin === 'https://web.whatsapp.com' && !await chrome.permissions.contains({ origins: ['https://web.whatsapp.com/*'] })) throw new Error('Разрешение на эту страницу отозвано. Подключите её заново в настройках.');
@@ -48,6 +49,9 @@ async function stableId(value) {
 async function canonicalConversation(value) {
   if (!value || typeof value !== 'object' || !Array.isArray(value.messages ?? [])) throw new Error('Нужен контекст диалога.');
   const platform = String(value.platform ?? 'manual'); const chatId = String(value.chatId ?? value.id ?? '');
+  const accountId = String(value.accountId ?? '');
+  const accountScope = String(value.accountScope ?? '');
+  if (platform === 'whatsapp' && !accountId && !accountScope.trim()) throw new Error('Перед сохранением задайте локальную метку аккаунта WhatsApp. Она отделяет ваши архивы и не подтверждает аккаунт.');
   if (!chatId) throw new Error('Нет идентификатора диалога.');
   const profile = value.profile ?? {};
   const photos = Array.isArray(value.photos) ? value.photos : Array.isArray(profile.photos) ? profile.photos : [];
@@ -56,12 +60,44 @@ async function canonicalConversation(value) {
     const text = String(message.text ?? message.content ?? '');
     const role = ['user', 'assistant', 'system', 'incoming', 'outgoing', 'unknown'].includes(message.role) ? message.role : 'unknown';
     const createdAt = typeof message.createdAt === 'string' && Number.isFinite(Date.parse(message.createdAt)) ? new Date(message.createdAt).toISOString() : null;
-    const signature = JSON.stringify([platform, chatId, role, text, createdAt]); const ordinal = counters.get(signature) ?? 0; counters.set(signature, ordinal + 1);
+    const signature = JSON.stringify([platform, accountId, accountScope, chatId, role, text, createdAt]); const ordinal = counters.get(signature) ?? 0; counters.set(signature, ordinal + 1);
     return { id: typeof message.id === 'string' && message.id ? message.id : `derived:${await stableId(signature + ':' + ordinal)}`, role, text, createdAt, ...(Array.isArray(message.attachments) ? { attachments: message.attachments } : {}) };
   }));
-  return { id: chatId.startsWith(platform + ':') ? chatId : `${platform}:${chatId}`, chatId, accountId: String(value.accountId ?? ''), platform, title: String(value.title ?? profile.name ?? 'Диалог'),
-    profile: { id: String(profile.id ?? ''), name: String(profile.name ?? ''), bio: String(profile.bio ?? ''), photos: Array.isArray(profile.photos) ? profile.photos : photos },
+  const normalizedProfile = raw => normalizeStoredProfile(Object.fromEntries(PROFILE_FIELDS.filter(key => raw?.[key] !== undefined).map(key => [key, raw[key]])));
+  const state = await library.getState();
+  const matches = state.conversations.filter(item => !item.deleted && item.platform === platform && item.accountId === accountId && (item.accountScope ?? '') === accountScope && item.chatId === chatId);
+  const existing = matches.find(item => item.id === value.id) ?? (matches.length === 1 ? matches[0] : null);
+  if (!existing && matches.length > 1) throw new Error('Для этого диалога найдено несколько записей. Выберите сохранённую запись перед обновлением.');
+  return { id: existing?.id ?? getConversationKey({ platform, accountId, accountScope, chatId }), chatId, accountId, accountScope, platform, title: String(value.title ?? profile.name ?? 'Диалог'),
+    profile: normalizedProfile({ ...profile, photos: Array.isArray(profile.photos) ? profile.photos : photos }),
+    accountProfile: value.accountProfile == null ? null : normalizedProfile(value.accountProfile),
     messages, photos, partial: value.partial !== false, capturedAt: new Date().toISOString() };
+}
+
+async function targetConversation(payload, allowProvided = false) {
+  const state = await library.getState();
+  const local = payload.conversationId ? state.conversations.find(item => item.id === payload.conversationId && !item.deleted) : null;
+  if (local && payload.conversation && getConversationKey(local) !== getConversationKey(payload.conversation)) throw new Error('Идентичность карточки не соответствует сохранённому диалогу.');
+  const conversation = local ?? (allowProvided ? payload.conversation : null);
+  if (!conversation || !['tinder', 'whatsapp'].includes(conversation.platform) || typeof conversation.chatId !== 'string' || !conversation.chatId) throw new Error('Выберите сохранённый диалог поддерживаемой платформы.');
+  if (!conversation.accountId) throw new Error('Не удалось подтвердить аккаунт. Откройте нужный чат и используйте панель на странице.');
+  getConversationKey(conversation);
+  return conversation;
+}
+
+async function findConversationTabs(conversation, exactChat) {
+  if (conversation.platform === 'whatsapp' && !await chrome.permissions.contains({ origins: ['https://web.whatsapp.com/*'] })) throw new Error('Разрешите WhatsApp Web в настройках.');
+  // URL filters require broader tab access. Only our installed site adapters can answer this RPC.
+  const tabs = (await chrome.tabs.query({})).sort((left, right) => Number(right.active) - Number(left.active));
+  if (tabs.length > 500) throw new Error('Открыто больше 500 вкладок. Закройте лишние вкладки перед выбором чата.');
+  const matches = [];
+  for (const tab of tabs) {
+    try {
+      const identity = await chrome.tabs.sendMessage(tab.id, { type: 'replylab:identify' }, { frameId: 0 });
+      if (identity?.ok && identity.platform === conversation.platform && identity.accountId === conversation.accountId && (!exactChat || identity.chatId === conversation.chatId)) matches.push({ tab, identity });
+    } catch { /* A tab without an active adapter cannot prove its account. */ }
+  }
+  return matches;
 }
 async function ai(task, payload, { signal, onDelta } = {}) {
   const state = await library.getState(); const local = await device();
@@ -74,6 +110,31 @@ async function ai(task, payload, { signal, onDelta } = {}) {
 async function runAction(action, payload = {}, sender) {
   const privileged = ownPage(sender);
   if (!privileged && !PAGE_ACTIONS.has(action)) throw new Error('Это действие доступно только в настройках расширения.');
+  if (action === 'insert-draft' || action === 'open-conversation') {
+    const conversation = await targetConversation(payload, action === 'open-conversation');
+    const matches = await findConversationTabs(conversation, action === 'insert-draft');
+    const chosen = matches.find(item => item.tab.active && item.identity.visible) ?? (matches.length === 1 ? matches[0] : null);
+    if (!chosen) throw new Error('Откройте один чат нужного аккаунта в браузере и повторите действие.');
+    if (action === 'insert-draft') {
+      if (typeof payload.text !== 'string' || !payload.text.trim() || payload.text.length > 10000) throw new Error('Текст черновика должен содержать от 1 до 10 000 символов.');
+      await chrome.tabs.update(chosen.tab.id, { active: true });
+      if (chrome.windows?.update && Number.isInteger(chosen.tab.windowId)) await chrome.windows.update(chosen.tab.windowId, { focused: true });
+      let ready = false;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const identity = await chrome.tabs.sendMessage(chosen.tab.id, { type: 'replylab:identify' }, { frameId: 0 });
+        if (!identity?.ok || identity.platform !== conversation.platform || identity.accountId !== conversation.accountId || identity.chatId !== conversation.chatId) throw new Error('Открытый диалог изменился. Черновик не вставлен.');
+        if (identity.visible) { ready = true; break; }
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      if (!ready) throw new Error('Сделайте вкладку чата видимой и повторите вставку.');
+      const result = await chrome.tabs.sendMessage(chosen.tab.id, { type: 'replylab:insert-draft', expected: { platform: conversation.platform, accountId: conversation.accountId, chatId: conversation.chatId }, text: payload.text }, { frameId: 0 });
+      if (!result?.ok) throw new Error(result?.error || 'Страница не подтвердила подготовку черновика.');
+      return { ok: true, pendingConfirmation: result.pendingConfirmation === true };
+    }
+    if (conversation.platform !== 'tinder') throw new Error('Выберите нужный диалог WhatsApp вручную. Автоматический переход не подтверждён.');
+    await chrome.tabs.update(chosen.tab.id, { active: true, url: 'https://tinder.com/app/messages/' + encodeURIComponent(conversation.chatId) });
+    return { ok: true };
+  }
   if (action === 'whatsapp-enable') {
     if (!(await chrome.permissions.contains({ origins: ['https://web.whatsapp.com/*'] }))) throw new Error('Сначала разрешите доступ к WhatsApp Web.');
     await optionalScripts(); return { ok: true };
@@ -86,6 +147,7 @@ async function runAction(action, payload = {}, sender) {
   if (AI_ACTIONS.has(action)) return ai(action, payload);
   if (action === 'sync') return { ok: true, ...await synchronize() };
   if (LOCAL_ACTIONS.has(action)) {
+    if (['save-note', 'append-note'].includes(action) && payload.conversation) payload = { ...payload, ...payload.conversation };
     if (action === 'capture') payload = { conversation: await canonicalConversation(payload.conversation ?? payload.context ?? payload) };
     if (action === 'save-settings' && !privileged) {
       if (!payload.settings || Object.keys(payload.settings).some(key => !['blurImages', 'geo'].includes(key))) throw new Error('Страница может менять только видимость изображений и геолокацию.');
@@ -94,7 +156,7 @@ async function runAction(action, payload = {}, sender) {
       const state = await library.getState(); const local = await device();
       if (!(await masked(state, local)).settings.autoSendEnabled) throw new Error('Автоотправка не разрешена на этом устройстве.');
       const item = state.schedules.find(item => item.id === payload.id && !item.deleted);
-      if (!item || item.status !== 'scheduled' || item.sendMode !== 'automatic' || item.chatId !== payload.chatId || item.incomingSnapshot !== payload.incomingSnapshot || Date.parse(item.fireAt) > Date.now()) throw new Error('Запись расписания нельзя выполнить.');
+      if (!payload.accountId || !item || item.status !== 'scheduled' || item.sendMode !== 'automatic' || item.accountId !== payload.accountId || item.chatId !== payload.chatId || item.incomingSnapshot !== payload.incomingSnapshot || Date.parse(item.fireAt) > Date.now()) throw new Error('Запись расписания нельзя выполнить.');
       const unchanged = current => current && current.status === 'scheduled' && current.fireAt === payload.expected?.fireAt
         && current.text === payload.expected?.text && current.updatedAt === payload.expected?.updatedAt && current.incomingSnapshot === payload.incomingSnapshot;
       if (!unchanged(item)) throw new Error('Версия записи расписания изменилась.');
@@ -120,6 +182,16 @@ async function runAction(action, payload = {}, sender) {
     return action === 'export' ? { ok: true, result } : { ok: true, state: await masked(result) };
   }
   const state = await library.getState(); const local = await device(); const options = await connection(state, local);
+  const catalog = /^(catalog|template)-(list|save|delete)$/.exec(action);
+  if (catalog) {
+    const path = catalog[1] === 'catalog' ? '/catalog' : '/templates';
+    if (catalog[2] === 'list') return { ok: true, ...await serverRequest(path, options) };
+    if (catalog[2] === 'delete') {
+      if (typeof payload.id !== 'string' || !payload.id) throw new Error('Нужен ID записи каталога.');
+      return { ok: true, ...await serverRequest(path + '/' + encodeURIComponent(payload.id), { ...options, method: 'DELETE' }) };
+    }
+    return { ok: true, ...await serverRequest(path + (payload.id ? '/' + encodeURIComponent(payload.id) : ''), { ...options, method: payload.id ? 'PUT' : 'POST', body: catalog[1] === 'catalog' ? { style: payload.style } : { template: payload.template } }) };
+  }
   if (action === 'server-status') return { ok: true, ...await serverRequest('/status', options) };
   if (action === 'provider-models') return { ok: true, ...await serverRequest('/models?provider=' + encodeURIComponent(payload.provider ?? state.settings.provider), options) };
   if (action === 'provider-usage') return { ok: true, ...await serverRequest('/provider-usage?provider=' + encodeURIComponent(payload.provider ?? state.settings.provider), options) };
@@ -151,7 +223,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     const view = ['assistant', 'styles', 'history', 'analytics', 'schedules', 'settings'].includes(message.view) ? message.view : '';
     await chrome.tabs.create({ url: chrome.runtime.getURL('index.html') + (view ? '#' + view : '') });
     return { ok: true };
-  })().then(respond, error => respond({ ok: false, error: safeError(error) })); return true;
+  })().then(respond, error => respond(failure(error))); return true;
 });
 
 chrome.runtime.onConnect?.addListener(port => {
@@ -164,7 +236,7 @@ chrome.runtime.onConnect?.addListener(port => {
     if (STREAMS.size >= 4) { post({ type: 'error', id: message.id, error: 'Одновременно доступны четыре потока.' }); return; }
     const controller = new AbortController(); const key = Symbol(message.id); requests.set(message.id, controller); STREAMS.set(key, controller);
     checkSitePermission(port.sender).then(() => ai(message.task, message.payload ?? {}, { signal: controller.signal, onDelta: text => post({ type: 'delta', id: message.id, text }) }))
-      .then(result => post({ type: 'result', id: message.id, result }), error => post({ type: 'error', id: message.id, error: safeError(error) }))
+      .then(result => post({ type: 'result', id: message.id, result }), error => post({ type: 'error', id: message.id, ...failure(error) }))
       .finally(() => { requests.delete(message.id); STREAMS.delete(key); });
   });
   port.onDisconnect.addListener(() => { for (const controller of requests.values()) controller.abort(); });

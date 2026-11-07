@@ -2,7 +2,7 @@ import http from 'node:http';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual, randomUUID } from 'node:crypto';
-import { createStore, StoreConflictError } from './server-store.mjs';
+import { createStore, StoreConflictError, StoreNotFoundError } from './server-store.mjs';
 import { createProviders, ProviderError } from './providers.mjs';
 
 const EXTENSION_ORIGIN = /^chrome-extension:\/\/[a-p]{32}$/;
@@ -40,7 +40,7 @@ export function createGateway({ apiKey, fetchImpl = fetch, env = process.env, di
   const getOAuth = () => oauth ? Promise.resolve(oauth) : (oauthPromise ??= import('./oauth.mjs').then(module => module.createOAuthService({ directory: join(directory, 'oauth'), fetchImpl })));
   const providers = suppliedProviders ?? createProviders({ apiKey, fetchImpl, env, directory, credentialResolver: async provider => {
     try { return await (await getOAuth()).credential(provider); }
-    catch { throw new ProviderError(503, 'Подключите аккаунт provider в настройках OAuth.'); }
+    catch { throw new ProviderError(503, 'Подключите аккаунт provider в настройках OAuth.', 'auth', false); }
   } });
   const publicOrigin = publicUrl ? new URL(publicUrl).origin : '';
   if (publicUrl && !/^https?:\/\//.test(publicUrl)) throw new TypeError('PUBLIC_URL должен быть HTTP(S) URL.');
@@ -87,12 +87,24 @@ export function createGateway({ apiKey, fetchImpl = fetch, env = process.env, di
       if (origin !== undefined && !allowedOrigin) throw new RequestError(403, 'Этот источник запроса не разрешён.');
       if (request.method === 'OPTIONS') {
         if (!origin) throw new RequestError(403, 'Для preflight нужен источник расширения.');
-        response.writeHead(204, { ...commonHeaders, 'Access-Control-Allow-Methods': url.pathname === '/replies' ? 'POST, OPTIONS' : 'GET, POST, DELETE, OPTIONS', 'Access-Control-Allow-Headers': serverToken ? 'Content-Type, X-ReplyLab, Authorization' : 'Content-Type, X-ReplyLab' }); response.end(); return;
+        response.writeHead(204, { ...commonHeaders, 'Access-Control-Allow-Methods': url.pathname === '/replies' ? 'POST, OPTIONS' : 'GET, POST, PUT, DELETE, OPTIONS', 'Access-Control-Allow-Headers': serverToken ? 'Content-Type, X-ReplyLab, Authorization' : 'Content-Type, X-ReplyLab' }); response.end(); return;
       }
       if (request.headers['x-replylab'] !== '1') throw new RequestError(403, 'Нет заголовка X-ReplyLab: 1.');
       if (serverToken && !validToken(request.headers.authorization?.replace(/^Bearer /, ''), serverToken)) throw new RequestError(401, 'Нужен действующий токен локального сервера.');
+      const resource = /^\/(catalog|templates)(?:\/([^/]+))?$/.exec(url.pathname);
+      let resourceId;
+      try { resourceId = resource?.[2] ? decodeURIComponent(resource[2]) : undefined; }
+      catch { throw new RequestError(400, 'Некорректный ID записи.'); }
       if (request.method === 'GET') {
-        if (url.pathname === '/status') { send(200, { version: 1, providers: await providers.status(), oauth: await (await getOAuth()).status(), capabilities: ['sync', 'import', 'search', 'shares', 'analytics', 'replies', 'assistant', 'stream', 'oauth'] }); return; }
+        if (url.pathname === '/status') { send(200, { version: 1, providers: await providers.status(), oauth: await (await getOAuth()).status(), capabilities: ['sync', 'import', 'search', 'shares', 'analytics', 'replies', 'assistant', 'assistant-tools', 'stream', 'oauth', 'catalog', 'templates'] }); return; }
+        if (resource) {
+          const result = await (resource[1] === 'catalog' ? store.catalog() : store.templates());
+          if (resourceId) {
+            const item = result.items.find(item => item.id === resourceId);
+            if (!item) throw new RequestError(404, 'Запись не найдена.'); send(200, { item, revision: result.revision, source: result.source });
+          } else send(200, result);
+          return;
+        }
         if (url.pathname === '/oauth/status') { send(200, await (await getOAuth()).status()); return; }
         if (url.pathname === '/models') { send(200, { models: await providers.models(url.searchParams.get('provider') ?? 'openai', controller.signal) }); return; }
         if (url.pathname === '/provider-usage') { send(200, await providers.usage(url.searchParams.get('provider') ?? 'openai', controller.signal)); return; }
@@ -101,13 +113,20 @@ export function createGateway({ apiKey, fetchImpl = fetch, env = process.env, di
         if (url.pathname === '/analytics') { send(200, await store.analytics(url.searchParams.get('tz') ?? 'UTC')); return; }
         throw new RequestError(404, 'Маршрут не найден.');
       }
+      if (request.method === 'DELETE' && resource && resourceId) { send(200, await (resource[1] === 'catalog' ? store.deleteCatalog(resourceId) : store.deleteTemplate(resourceId))); return; }
       if (request.method === 'DELETE' && /^\/shares\/[A-Za-z0-9_-]{32}$/.test(url.pathname)) { send(200, await store.deleteShare(url.pathname.slice(8))); return; }
-      if (request.method !== 'POST') throw new RequestError(405, 'Используйте POST /replies.');
+      if (request.method !== 'POST' && !(request.method === 'PUT' && resource && resourceId)) throw new RequestError(405, 'Метод запроса не поддерживается.');
       if (request.headers['content-type']?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new RequestError(415, 'Нужен Content-Type: application/json.');
       const limit = ['/sync', '/import', '/assistant', '/stream', '/replies'].includes(url.pathname) ? 8 * 1024 * 1024 : 64 * 1024;
       if (Number(request.headers['content-length']) > limit) throw new RequestError(413, 'Запрос слишком большой.');
       const input = await readBody(request, limit);
       if (!input || Array.isArray(input) || typeof input !== 'object') throw new RequestError(400, 'Нужен JSON-объект.');
+      if (resource) {
+        if (request.method === 'POST' && resourceId) throw new RequestError(405, 'Для изменения записи используйте PUT.');
+        const field = resource[1] === 'catalog' ? 'style' : 'template';
+        if (!input[field] || Object.keys(input).some(key => ![field, 'id'].includes(key))) throw new RequestError(400, `Нужно поле ${field}.`);
+        send(request.method === 'POST' ? 201 : 200, await (resource[1] === 'catalog' ? store.saveCatalog(input.style, resourceId) : store.saveTemplate(input.template, resourceId))); return;
+      }
       if (url.pathname === '/oauth/start') { send(200, await (await getOAuth()).start(input.provider, `http://127.0.0.1:${server.address().port}`, { accountId: input.accountId })); return; }
       if (url.pathname === '/oauth/disconnect') { send(200, await (await getOAuth()).disconnect(input.provider, input.accountId)); return; }
       if (url.pathname === '/oauth/select') { send(200, await (await getOAuth()).select(input.provider, input.accountId)); return; }
@@ -130,20 +149,25 @@ export function createGateway({ apiKey, fetchImpl = fetch, env = process.env, di
       const history = input.messages ?? session?.messages ?? [];
       if (input.sessionId && history.length > 38) throw new RequestError(409, 'Сначала экспортируйте историю: в сессии уже 39–40 сообщений.');
       const aiInput = { ...input, style, model: input.model ?? style?.model ?? state.settings[task === 'replies' ? 'suggestionModel' : 'assistantModel'], provider: input.provider ?? state.settings.provider ?? 'openai', systemPrompt: input.systemPrompt ?? style?.prompt ?? state.settings.systemPrompt ?? '', memories: input.memories ?? state.memories, ...(task === 'replies' ? {} : { messages: history }) };
-      const result = await providers.complete(aiInput, { task, signal: controller.signal, ...(url.pathname === '/stream' ? { onDelta: text => event('delta', { text }) } : {}) });
+      const result = await providers.complete(aiInput, { task, signal: controller.signal, executeTool: async (name, args) => {
+        if (name !== 'searchPastReplies') throw new TypeError('Инструмент не разрешён.');
+        return store.searchPastReplies(args);
+      }, ...(url.pathname === '/stream' ? { onDelta: text => event('delta', { text }) } : {}) });
       if (input.sessionId && task === 'assistant') {
         const now = new Date().toISOString();
         const message = (role, text) => ({ id: randomUUID(), role, text, createdAt: now });
-        await store.merge({ version: 1, assistantChats: [{ ...session, id: input.sessionId, title: session?.title ?? input.title ?? input.text.slice(0, 80), model: aiInput.model, messages: [...history, message('user', input.text), message('assistant', result.text)], createdAt: session?.createdAt ?? now, updatedAt: now }] });
+        await store.merge({ version: 1, assistantChats: [{ ...session, id: input.sessionId, title: session?.title ?? input.title ?? input.text.slice(0, 80), model: aiInput.model, messages: [...history, message('user', input.text), { ...message('assistant', result.text), ...(result.toolResults?.length ? { toolResults: result.toolResults } : {}) }], createdAt: session?.createdAt ?? now, updatedAt: now }] });
       }
       if (url.pathname === '/stream') { event('result', result); event('done', {}); response.end(); }
       else send(200, result);
     } catch (error) {
       request.resume();
-      const status = error instanceof RequestError || error instanceof ProviderError || error instanceof StoreConflictError ? error.status : error instanceof TypeError || error instanceof RangeError ? 400 : 500;
+      const status = error instanceof RequestError || error instanceof ProviderError || error instanceof StoreConflictError || error instanceof StoreNotFoundError ? error.status : error instanceof TypeError || error instanceof RangeError ? 400 : 500;
       const message = status === 500 ? 'Локальная ошибка шлюза.' : error.message;
-      if (response.headersSent) { if (!response.destroyed) { event('error', { error: message }); response.end(); } }
-      else send(status, { error: message });
+      const failure = { error: message, ...(error instanceof ProviderError ? { code: error.code, retryable: error.retryable,
+        ...(typeof error.model === 'string' ? { model: error.model } : {}), ...(Number.isFinite(error.elapsedMs) ? { elapsedMs: error.elapsedMs } : {}) } : {}) };
+      if (response.headersSent) { if (!response.destroyed) { event('error', failure); response.end(); } }
+      else send(status, failure);
     }
   });
   server.store = store; server.providers = providers;

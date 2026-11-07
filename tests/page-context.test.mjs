@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { platformFor, objectIdTimestamp, normalizeProfile, conversationFromTinder, conversationFromWhatsApp,
   normalizeSiteSnapshot, incomingSnapshot, transcript, validGeo, photoUrl, canAutoSendContext,
-  styleConditions, isStyleEligible, instagramLinks, languageHint } from '../extension/site-context.js';
+  styleConditions, isStyleEligible, instagramLinks, languageHint, portableConversation, savedConversationFor, captureChanged, sameConversation, outgoingAcknowledged, normalizeLoadedBatch } from '../extension/site-context.js';
 
 const tinder = JSON.parse(await readFile(new URL('./site-fixtures/tinder.json', import.meta.url)));
 const whatsapp = JSON.parse(await readFile(new URL('./site-fixtures/whatsapp.json', import.meta.url)));
@@ -16,7 +16,7 @@ test('Tinder extracts only active loaded conversation with observed message dire
   assert.deepEqual(context.messages.map(message => message.role), ['assistant', 'user']);
   assert.equal(context.messages[0].text, 'Как прошёл день?');
   assert.equal(context.partial, true);
-  assert.equal(context.photos.length, 2);
+  assert.deepEqual(context.photos, ['https://example.test/photo-small.jpg']);
   assert.equal(conversationFromTinder(tinder, '/app/messages/other-chat'), null);
   assert.equal(conversationFromTinder(tinder, '/app/messages/%'), null);
   assert.equal(conversationFromTinder({}, loc.pathname), null);
@@ -133,4 +133,82 @@ test('language hints are explicitly heuristic and avoid unsupported guesses on s
   assert.equal(languageHint('ok').code, null);
   assert.equal(languageHint('hej').code, null);
   assert.equal(languageHint('hello and thanks').heuristic, true);
+});
+
+test('rich loaded profile and own account preserve only observed portable fields', () => {
+  const state = structuredClone(tinder);
+  const rich = { _id: 'synthetic-self', name: 'Тест', age: 28, city: { name: 'Riga' }, distance_mi: 2,
+    user_interests: { selected_interests: [{ name: 'Кино' }] },
+    selected_descriptors: [{ id: 'height', name: 'Рост', type: 'measurement', measurable_selection: { value: 175, unit_of_measure: 'cm' } },
+      { id: 'pets', name: 'Животные', type: 'multi_selection_set', choice_selections: [{ name: 'Кошки' }, { name: 'Собаки' }] }],
+    user_prompts: { prompts: [{ id: 'q1', question_text: 'Любимый день?', answer_text: 'Суббота' }] },
+    spotify: { spotify_theme_track: { name: 'Synthetic song', artists: [{ name: 'Synthetic artist' }] } },
+    secret: 'must-not-be-portable' };
+  state.profile.user = rich;
+  state.entities.profiles['659200800000000000000001'] = rich;
+  const context = conversationFromTinder(state, loc.pathname), portable = portableConversation(context);
+  assert.deepEqual(portable.profile.interests, ['Кино']);
+  assert.deepEqual(portable.profile.descriptors.map(value => value.value), ['175 cm', 'Кошки, Собаки']);
+  assert.deepEqual(portable.profile.userPrompts, [{ id: 'q1', question: 'Любимый день?', answer: 'Суббота' }]);
+  assert.deepEqual(portable.profile.spotify.themeTrack, { name: 'Synthetic song', artists: ['Synthetic artist'] });
+  assert.equal(portable.accountProfile.name, 'Тест');
+  assert.equal(portable.accountProfile.age, 28); assert.equal(portable.profile.city, 'Riga');
+  assert.equal(JSON.stringify(portable).includes('must-not-be-portable'), false);
+  const huge = normalizeProfile({ bio: 'a'.repeat(100000), userPrompts: Array.from({ length: 100 }, (_, i) => ({ id: String(i), answer: 'x'.repeat(20000) })),
+    descriptors: Array.from({ length: 120 }, () => ({ value: 'y'.repeat(3000) })) });
+  assert(huge.bio.length <= 50000); assert(huge.userPrompts.length <= 50); assert(JSON.stringify(huge).length < 200000); assert.equal(huge.richPartial, true);
+});
+
+test('continuous capture only matches an explicitly saved exact account and ignores archived unseen messages', () => {
+  const context = conversationFromTinder(tinder, loc.pathname), saved = { ...portableConversation(context), id: 'canonical-id' };
+  saved.messages.unshift({ id: 'archived', role: 'assistant', text: 'Ранее загруженное', createdAt: null });
+  const state = { conversations: [saved] };
+  assert.equal(savedConversationFor(state, context), saved);
+  assert.equal(captureChanged(saved, context), false);
+  assert.equal(savedConversationFor(state, { ...context, accountId: 'other' }), null);
+  assert.equal(savedConversationFor(state, { ...context, accountId: '' }), null);
+  assert.equal(savedConversationFor({ conversations: [{ ...saved, deleted: true }] }, context), null);
+  assert.equal(savedConversationFor({ conversations: [] }, context), null);
+  const changed = structuredClone(context); changed.messages.push({ id: 'm3', role: 'assistant', text: 'Новое сообщение', createdAt: null });
+  assert.equal(captureChanged(saved, changed), true);
+  assert.equal(captureChanged(saved, { ...context, accountProfile: { ...context.accountProfile, bio: 'Новое описание' } }), true);
+  assert.equal(sameConversation(context, { ...context, accountId: 'other' }), false);
+});
+
+test('queue acknowledgement requires new outgoing exact text in the same verified loaded conversation', () => {
+  const context = conversationFromTinder(tinder, loc.pathname);
+  const attempt = { platform: context.platform, accountId: context.accountId, chatId: context.chatId, text: 'Хорошо, спасибо!', after: Date.parse('2026-11-07T11:00:00Z'), knownIds: ['m1', 'm2'] };
+  assert.equal(outgoingAcknowledged(context, attempt), false);
+  context.messages.push({ id: 'm3', role: 'user', text: attempt.text, createdAt: '2026-11-07T11:00:01Z' });
+  assert.equal(outgoingAcknowledged(context, attempt), true);
+  context.messages.at(-1).createdAt = '2026-11-01T00:00:00Z'; assert.equal(outgoingAcknowledged(context, attempt), false);
+  context.messages.at(-1).createdAt = '2026-11-07T11:00:01Z';
+  assert.equal(outgoingAcknowledged({ ...context, accountId: 'other' }, attempt), false);
+  assert.equal(outgoingAcknowledged({ ...context, currentReliable: false }, attempt), false);
+  assert.equal(outgoingAcknowledged({ ...context, source: 'rendered-dom' }, attempt), false);
+  context.messages.at(-1).role = 'assistant'; assert.equal(outgoingAcknowledged(context, attempt), false);
+  context.messages.at(-1).role = 'user'; context.messages.at(-1).text = 'Другой текст'; assert.equal(outgoingAcknowledged(context, attempt), false);
+});
+
+test('loaded import normalizer checks account, bounds and keeps bulk data ineligible for automatic send', () => {
+  const raw = { platform: 'tinder', accountId: 'synthetic-self', accountProfile: tinder.profile.user, nextCursor: 50, unknownDateCount: 2,
+    conversations: [{ chatId: 'demo-chat', profile: tinder.entities.profiles['659200800000000000000001'], messages: Object.values(tinder.entities.messages), loadedMessageCount: 2 }] };
+  const batch = normalizeLoadedBatch(raw, 'synthetic-self');
+  assert.equal(batch.conversations.length, 1); assert.equal(batch.nextCursor, 50); assert.equal(batch.unknownDateCount, 2);
+  assert.equal(batch.conversations[0].messages.length, 2); assert.equal(batch.partial, true);
+  assert.equal(canAutoSendContext(batch.conversations[0]), false);
+  assert.equal(normalizeLoadedBatch(raw, 'other'), null);
+  assert.equal(normalizeLoadedBatch({ ...raw, conversations: Array(51).fill(raw.conversations[0]) }, 'synthetic-self'), null);
+});
+
+
+test('unverified local account labels isolate manual WhatsApp identities and never authorize automatic capture or send', () => {
+  const base = conversationFromWhatsApp(whatsapp, '/');
+  const first = { ...base, accountScope: 'Owner A' }, second = { ...base, accountScope: 'Owner B' };
+  assert.equal(first.accountId, '');
+  assert.equal(sameConversation(first, second), false);
+  assert.notEqual(incomingSnapshot(first), incomingSnapshot(second));
+  assert.equal(portableConversation(first).accountScope, 'Owner A');
+  assert.equal(canAutoSendContext(first), false);
+  assert.equal(savedConversationFor({ conversations: [{ ...portableConversation(first), id: 'saved' }] }, first), null);
 });

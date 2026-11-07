@@ -11,7 +11,7 @@ export function stream(task, payload, { onDelta, signal } = {}) {
     port.onMessage.addListener((event) => {
       if (event.id !== id) return;
       if (event.type === 'delta') onDelta?.(event.text);
-      if (event.type === 'error') end(new Error(event.error));
+      if (event.type === 'error') end(Object.assign(new Error(event.error), { code: event.code, retryable: event.retryable }));
       if (event.type === 'result') end(null, event.result);
     });
     port.onDisconnect.addListener(() => { if (!finished) end(new Error(chrome.runtime.lastError?.message || 'Поток прерван.')); });

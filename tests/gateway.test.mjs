@@ -87,7 +87,7 @@ test('successful request uses fixed HTTPS upstream and server-only credentials',
   assert.equal(response.headers.get('access-control-allow-origin'), ORIGIN);
   const raw = await response.text();
   assert.equal(raw.includes('server-only-test-key'), false);
-  assert.deepEqual(JSON.parse(raw), { replies: REPLIES });
+  assert.deepEqual(JSON.parse(raw).replies, REPLIES); assert.equal(JSON.parse(raw).model, INPUT.model); assert.equal(typeof JSON.parse(raw).elapsedMs, 'number');
   assert.equal(captured.upstreamUrl, 'https://api.openai.com/v1/chat/completions');
   assert.equal(captured.options.method, 'POST');
   assert.equal(captured.options.redirect, 'error');
@@ -219,4 +219,73 @@ test('provider usage endpoint requires authentication and never exposes provider
   assert.equal((await fetch(`${base}/provider-usage?provider=openrouter`, { headers: HEADERS })).status, 401);
   const response = await fetch(`${base}/provider-usage?provider=openrouter`, { headers: { ...HEADERS, Authorization: 'Bearer owner-test-token' } });
   assert.equal(response.status, 200); const text = await response.text(); assert.equal(text.includes('private-'), false); assert.equal(JSON.parse(text).remaining, 3.5);
+});
+
+test('own catalog and template routes enforce auth and provide persistent CRUD with PUT preflight', async t => {
+  const base = await backend(t, { serverToken: 'owner-test-token' });
+  const headers = { ...HEADERS, Authorization: 'Bearer owner-test-token' };
+  assert.equal((await fetch(`${base}/catalog`, { headers: HEADERS })).status, 401);
+  assert.deepEqual((await (await fetch(`${base}/catalog`, { headers })).json()).items, []);
+  const preflight = await fetch(`${base}/templates/test`, { method: 'OPTIONS', headers: { Origin: ORIGIN } });
+  assert.match(preflight.headers.get('access-control-allow-methods'), /PUT/);
+  const saved = await (await post(`${base}/catalog`, { headers, input: { style: { name: 'Own style', prompt: 'Facts only.' } } })).json();
+  assert.equal(saved.item.shared, true);
+  const changed = await fetch(`${base}/catalog/${saved.item.id}`, { method: 'PUT', headers, body: JSON.stringify({ style: { prompt: 'Facts and warmth.' } }) });
+  assert.equal(changed.status, 200);
+  assert.equal((await (await fetch(`${base}/catalog/${saved.item.id}`, { headers })).json()).item.prompt, 'Facts and warmth.');
+  const template = await (await post(`${base}/templates`, { headers, input: { template: { name: 'Base', scope: 'assistant-base', prompt: 'Review only.' } } })).json();
+  assert.equal(template.item.version, 1);
+  assert.equal((await (await fetch(`${base}/templates`, { headers })).json()).source, 'own-server');
+  assert.equal((await fetch(`${base}/templates/${template.item.id}`, { method: 'PUT', headers, body: JSON.stringify({ template: { scope: 'bad' } }) })).status, 400);
+  assert.equal((await fetch(`${base}/templates/${template.item.id}`, { method: 'DELETE', headers })).status, 200);
+  assert.equal((await fetch(`${base}/templates/${template.item.id}`, { headers })).status, 404);
+  assert.equal((await fetch(`${base}/catalog/${saved.item.id}`, { method: 'DELETE', headers })).status, 200);
+  assert.equal((await (await fetch(`${base}/sync`, { headers })).json()).state.styles[0].deleted, true);
+});
+
+test('assistant tool history reads the real store with current-account scope and preserves reviewable results', async t => {
+  let calls = 0;
+  const base = await backend(t, { apiKey: 'private-fixture-key', fetchImpl: async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (++calls === 1) return Response.json({ choices: [{ message: { tool_calls: [{ id: 'search', type: 'function', function: { name: 'searchPastReplies', arguments: JSON.stringify({ query: 'tea', current_account_only: true }) } }] }, finish_reason: 'tool_calls' }] });
+    const evidence = JSON.parse(body.messages.at(-1).content);
+    assert.equal(evidence.source, 'server-history'); assert.equal(evidence.results.length, 1); assert.equal(evidence.results[0].accountId, 'account-a');
+    return Response.json({ choices: [{ message: { content: 'Found the saved reply.' } }] });
+  } });
+  const conversation = account => ({ id: account, accountId: account, chatId: account, platform: 'tinder', messages: [
+    { id: account + '-p', role: 'assistant', text: 'Tea?', createdAt: null }, { id: account + '-u', role: 'user', text: 'Tea tomorrow.', createdAt: null },
+  ] });
+  await post(`${base}/sync`, { input: { conversations: [conversation('account-a'), conversation('account-b')] } });
+  const response = await post(`${base}/assistant`, { input: { ...INPUT, context: { accountId: 'account-a', platform: 'tinder' }, allowHistorySearch: true } });
+  assert.equal(response.status, 200); const result = await response.json(); assert.equal(result.text, 'Found the saved reply.'); assert.equal(result.toolResults[0].results.length, 1);
+  assert.equal(JSON.stringify(result).includes('private-fixture-key'), false);
+});
+
+test('HTTP and streamed errors retain safe reason codes without exposing upstream bodies', async t => {
+  const base = await backend(t, { apiKey: 'private-fixture-key', fetchImpl: async () => new Response('private-upstream-body', { status: 429 }) });
+  const failed = await post(`${base}/replies`); const body = await failed.json();
+  assert.equal(failed.status, 502); assert.equal(body.code, 'rate-limit'); assert.equal(body.retryable, true); assert.equal(body.model, INPUT.model); assert.equal(JSON.stringify(body).includes('private-'), false);
+  let streams = 0;
+  const streamBase = await backend(t, { apiKey: 'private-fixture-key', fetchImpl: async () => {
+    streams++;
+    return new Response(new ReadableStream({ start(controller) {
+      for (const event of [{ choices: [{ delta: { content: 'Partial' } }] }, { choices: [{ delta: {}, finish_reason: 'length' }] }]) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+      controller.close();
+    } }));
+  } });
+  const text = await (await post(`${streamBase}/stream`, { input: { ...INPUT, task: 'assistant' } })).text();
+  assert.match(text, /event: delta/); assert.match(text, /"code":"length"/); assert.equal(text.includes('event: done'), false); assert.equal(streams, 1);
+});
+
+test('completed assistant sessions persist structured review cards without saving a style automatically', async t => {
+  let calls = 0;
+  const base = await backend(t, { apiKey: 'fixture', fetchImpl: async () => {
+    if (++calls === 1) return Response.json({ choices: [{ message: { tool_calls: [{ id: 'style-call', type: 'function', function: { name: 'draftPrompt', arguments: JSON.stringify({ name: 'Warm', prompt: 'Short and kind.', useHistory: false }) } }] }, finish_reason: 'tool_calls' }] });
+    return Response.json({ choices: [{ message: { content: 'Review this style.' } }] });
+  } });
+  const response = await post(`${base}/assistant`, { input: { ...INPUT, sessionId: 'session-tools' } });
+  assert.equal(response.status, 200);
+  const saved = (await (await fetch(`${base}/sync`, { headers: HEADERS })).json()).state;
+  assert.equal(saved.assistantChats[0].messages[1].toolResults[0].type, 'draft-style');
+  assert.equal(saved.assistantChats[0].messages[1].toolResults[0].requiresConfirmation, true); assert.equal(saved.styles.length, 0);
 });

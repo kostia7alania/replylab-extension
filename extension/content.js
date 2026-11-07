@@ -1,5 +1,6 @@
 import { findComposer, insertReply, draftText, findSendButton, findProfileAnchor } from './page-adapter.js';
-import { platformFor, normalizeSiteSnapshot, renderedContext, incomingSnapshot, transcript, validGeo, canAutoSendContext, isStyleEligible, instagramLinks, languageHint } from './site-context.js';
+import { platformFor, normalizeSiteSnapshot, renderedContext, incomingSnapshot, transcript, validGeo, canAutoSendContext, isStyleEligible, instagramLinks, languageHint, portableConversation, savedConversationFor, captureChanged, sameConversation, outgoingAcknowledged, normalizeLoadedBatch } from './site-context.js';
+import { getConversationNote, getNoteKey } from './library.js';
 import { translate as uiTranslate, SOURCE_MESSAGES, SUPPORTED_LANGUAGES } from './locales.js';
 
 let stopCurrent = null;
@@ -14,13 +15,6 @@ const trusted = (element, callback) => element.addEventListener('click', event =
   });
 });
 
-function portableConversation(context) {
-  return { chatId: context.chatId, accountId: context.accountId ?? '', platform: context.platform, title: context.title,
-    profile: { id: context.profile?.id ?? '', name: context.profile?.name ?? '', bio: context.profile?.bio ?? '', photos: (context.photos ?? []).slice(0, 20) },
-    photos: (context.photos ?? []).slice(0, 20), partial: true,
-    messages: (context.messages ?? []).map(({ id, role, text, createdAt }) => ({ id, role, text, createdAt: createdAt ?? null })) };
-}
-
 function createPanel(composer, anchor, env) {
   const initial = env.context();
   const key = initial?.chatId ?? '';
@@ -34,13 +28,16 @@ function createPanel(composer, anchor, env) {
   panel.className = 'panel';
   panel.innerHTML = `
     <header><div><strong>ReplyLab</strong><span class="subtitle">Контекст открытого диалога</span></div><button type="button" class="settings">Настроить ReplyLab</button></header>
+    <section class="account-scope" hidden><label>Локальная метка аккаунта (не подтверждено)<input class="account-label" maxlength="100" autocomplete="off"></label><p class="scope-note">Метка задаётся вами для этой вкладки. Она не подтверждает аккаунт. Для другого аккаунта выберите другую метку перед сохранением.</p><button type="button" class="apply-account-scope secondary">Применить метку аккаунта</button></section>
     <div class="profile-summary"></div><p class="coverage"></p>
     <details class="profile-details"><summary>Профиль и фотографии</summary><p class="bio"></p><p class="language-hint"></p><p class="encountered"></p><p class="xray"></p><div class="bio-actions"><button type="button" class="copy-bio secondary">Копировать описание</button><button type="button" class="translate-bio secondary">Перевести описание</button></div><p class="bio-translation"></p><div class="instagram-links"></div><div class="photos"></div><label class="check"><input class="include-photos" type="checkbox">Прикрепить фотографии к запросу GPT</label></details>
     <label class="context-label">Дополнительный контекст<textarea class="context" rows="2" placeholder="Можно дополнить прочитанную часть диалога"></textarea></label>
     <div class="controls"><label>Тон<select class="tone"><option value="friendly">Дружелюбный</option><option value="playful">Игривый</option><option value="concise">Краткий</option></select></label><label>Стиль<select class="style"><option value="">Общий</option></select></label><label>Ответов<select class="count"><option>1</option><option>2</option><option selected>3</option></select></label></div>
+    <p class="photo-policy" hidden></p>
     <button type="button" class="generate">Предложить ответы</button><button type="button" class="cancel-generation secondary" hidden>Остановить генерацию</button><p class="status" role="status" aria-live="polite">Выберите действие. Отправку контролируете вы.</p><p class="live-result"></p>
-    <div class="results"></div><div class="confirmation" hidden></div>
+    <div class="results"></div><button type="button" class="append-replies secondary" hidden>Добавить все варианты в заметку</button><div class="confirmation" hidden></div>
     <div class="tools"><button type="button" class="capture secondary">Сохранить диалог</button><button type="button" class="copy-transcript secondary">Копировать историю</button><button type="button" class="export secondary">Экспорт .txt</button><button type="button" class="assistant secondary">Чат-ассистент</button></div>
+    <details class="import-section"><summary>Импорт загруженных диалогов</summary><p>Читаются только уже загруженные на сайте диалоги. Скрытые запросы не выполняются.</p><div class="controls"><label>С даты<input class="import-from" type="date"></label><label>По дату<input class="import-to" type="date"></label></div><button type="button" class="import-loaded secondary">Импортировать до 50 диалогов</button><p class="import-receipt" role="status"></p></details>
     <details class="external-section"><summary>Открыть во внешнем помощнике</summary><p class="external-note">Текст не передаётся автоматически. Сначала подтвердите копирование.</p><div class="external-tools"></div><div class="external-confirmation" hidden></div></details>
     <details class="note-section"><summary>Заметка к диалогу</summary><textarea class="note" rows="2" placeholder="Ваша локальная заметка"></textarea><button type="button" class="save-note secondary">Сохранить заметку</button></details>
     <details class="translation-section"><summary>Перевод</summary><div class="controls"><label>Язык<input class="language" value="ru" maxlength="40"></label><button type="button" class="translate secondary">Перевести историю</button></div><p class="translation"></p></details>
@@ -51,13 +48,14 @@ function createPanel(composer, anchor, env) {
   const $ = selector => shadow.querySelector(selector);
   const status = $('.status');
   const textSources = new WeakMap(), attributeSources = new WeakMap();
-  let disposed = false, requestNumber = 0, pending = null, cancelGeneration = null, lastIncoming = incomingSnapshot(initial), lastLibrary = null, lastProfile = '', lastLanguage = '', lastStyleSignature = '', savedCountSetting = null, manualCount = false;
+  let disposed = false, requestNumber = 0, pending = null, cancelGeneration = null, lastIncoming = incomingSnapshot(initial), lastLibrary = null, lastProfile = '', lastLanguage = '', lastStyleSignature = '', savedCountSetting = null, manualCount = false, lastReplies = [], importCursor = 0, importFilter = '';
+  let queueDisplayTimer = 0;
   const uiLanguage = () => SUPPORTED_LANGUAGES.includes(env.state()?.settings?.language) ? env.state().settings.language : env.state()?.settings?.language ? 'en' : 'ru';
   const label = (ru, en = UI_SOURCES.get(ru)) => en ? uiTranslate(ru, en, uiLanguage()) : ru;
   const format = (ru, en, values) => label(ru, en).replace(/\{\{(\w+)\}\}/g, (_, name) => String(values[name] ?? ''));
   function localizeUI() {
     host.lang = uiLanguage();
-    for (const element of shadow.querySelectorAll('button, summary, label, option, .subtitle, .footnote, .status, .external-note, .confirmation > p, .external-confirmation > p')) {
+    for (const element of shadow.querySelectorAll('button, summary, label, option, .subtitle, .footnote, .status, .external-note, .confirmation > p, .external-confirmation > p, .import-section > p, .scope-note')) {
       if (element.matches('option') && element.parentElement?.matches('.style') && element.value) continue;
       for (const node of element.childNodes) {
         if (node.nodeType !== Node.TEXT_NODE || !node.nodeValue.trim()) continue;
@@ -78,12 +76,15 @@ function createPanel(composer, anchor, env) {
     }
   }
   const notify = (text, error = false) => { status.textContent = text; status.classList.toggle('error', error); localizeUI(); };
-  const current = () => !disposed && host.isConnected && route === location.href && (env.context()?.chatId ?? '') === key
+  const current = () => !disposed && host.isConnected && route === location.href && sameConversation(initial, env.context())
     && (composer ? composer === findComposer(document, location) : anchor === findProfileAnchor(document, location));
   const run = async (action, payload) => {
     if (!current()) { env.schedule(); throw new Error('Открытый диалог изменился.'); }
     return env.action(action, payload);
   };
+  const scoped = () => env.context()?.platform !== 'whatsapp' || env.context()?.accountId || (env.context()?.accountScope && $('.account-label').value.trim() === env.context().accountScope);
+  const requireScope = () => { if (!scoped()) throw new Error('Введите локальную метку аккаунта перед сохранением. Аккаунт остаётся неподтверждённым.'); };
+  const noteIdentity = () => { requireScope(); const identity = savedConversationFor(env.state(), env.context()) ?? env.context(); return { conversationId: getNoteKey(identity), platform: identity.platform, accountId: identity.accountId ?? '', accountScope: identity.accountScope ?? '', chatId: identity.chatId }; };
   const event = kind => run('record-event', { event: { kind, platform: env.context()?.platform, chatId: key, at: new Date().toISOString() } }).catch(() => {});
   function clearPending() { pending = null; $('.confirmation').hidden = true; $('.confirmation').replaceChildren(); }
   function insert(text) {
@@ -146,6 +147,7 @@ function createPanel(composer, anchor, env) {
   }
   trusted($('.cancel-generation'), () => { cancelGeneration?.(); notify('Генерация отменена.'); });
   function render(replies) {
+    lastReplies = replies; $('.append-replies').hidden = !replies.length || env.state()?.settings?.showNotes === false;
     $('.results').replaceChildren(...replies.map(reply => {
       const article = Object.assign(document.createElement('article'), { className: 'reply' });
       const text = Object.assign(document.createElement('p'), { textContent: reply.text });
@@ -163,6 +165,11 @@ function createPanel(composer, anchor, env) {
       actions.append(add, copyButton, translateButton, scheduleButton); article.append(text, reason, actions, translated); return article;
     }));
   }
+  trusted($('.append-replies'), async () => {
+    if (!lastReplies.length) return;
+    await run('append-note', { ...noteIdentity(), text: lastReplies.map((reply, index) => `${index + 1}. ${reply.text}`).join('\n\n') });
+    notify('Все варианты добавлены в заметку.');
+  });
   trusted($('.generate'), async () => {
     if (!current()) { env.schedule(); return; }
     const context = env.context(), selection = window.getSelection();
@@ -171,7 +178,7 @@ function createPanel(composer, anchor, env) {
     if (!text) { notify('Добавьте контекст: сообщения или профиль пока не прочитаны.', true); $('.context').focus(); return; }
     if (text.length > 10000) { notify('Контекст длиннее 10 000 символов. Сократите его вручную.', true); return; }
     const number = ++requestNumber, before = incomingSnapshot(context);
-    clearPending(); $('.results').replaceChildren(); $('.live-result').textContent = ''; $('.generate').disabled = true; $('.cancel-generation').hidden = false; notify('Готовим варианты…');
+    clearPending(); lastReplies = []; $('.append-replies').hidden = true; $('.results').replaceChildren(); $('.live-result').textContent = ''; $('.generate').disabled = true; $('.cancel-generation').hidden = false; notify('Готовим варианты…');
     try {
       const response = await streamReplies({ text, tone: $('.tone').value, context,
         styleId: $('.style').value || undefined, count: Number($('.count').value), includePhotos: !$('.profile-details').hidden && $('.include-photos').checked }, number);
@@ -185,7 +192,7 @@ function createPanel(composer, anchor, env) {
   });
   trusted($('.settings'), () => chrome.runtime.sendMessage({ type: 'replylab:open-options' }).catch(() => notify('Откройте ReplyLab с панели расширений.', true)));
   trusted($('.assistant'), () => chrome.runtime.sendMessage({ type: 'replylab:open-options', view: 'assistant', context: portableConversation(env.context()) }));
-  trusted($('.capture'), async () => { await run('capture', { conversation: portableConversation(env.context()) }); notify('Загруженная часть диалога сохранена.'); });
+  trusted($('.capture'), async () => { requireScope(); await run('capture', { conversation: portableConversation(env.context()) }); env.captureSaved?.(); notify('Загруженная часть диалога сохранена.'); });
   trusted($('.copy-transcript'), () => copy(transcript(env.context())).catch(() => notify('Не удалось скопировать историю.', true)));
   trusted($('.copy-bio'), () => copy(env.context().profile?.bio || '').catch(() => notify('Не удалось скопировать описание.', true)));
   trusted($('.translate-bio'), () => translate(env.context().profile?.bio, $('.bio-translation')).catch(error => notify(error.message, true)));
@@ -214,7 +221,7 @@ function createPanel(composer, anchor, env) {
     Object.assign(document.createElement('a'), { href: url, download: `replylab-${context.platform}-${context.chatId.replace(/[^a-zA-Z0-9_-]/g, '_')}.txt` }).click();
     setTimeout(() => URL.revokeObjectURL(url), 1000); notify('История выгружена в .txt.');
   });
-  trusted($('.save-note'), async () => { await run('save-note', { chatId: key, text: $('.note').value }); notify('Заметка сохранена.'); });
+  trusted($('.save-note'), async () => { await run('save-note', { ...noteIdentity(), text: $('.note').value }); notify('Заметка сохранена.'); });
   trusted($('.translate'), () => translate(transcript(env.context()), $('.translation')).catch(error => notify(error.message, true)));
   $('.blur').addEventListener('change', event => { if (event.isTrusted) run('save-settings', { settings: { blurImages: event.target.checked } }).catch(error => notify(error.message, true)); });
   trusted($('.save-geo'), async () => {
@@ -223,34 +230,64 @@ function createPanel(composer, anchor, env) {
     await run('save-settings', { settings: { geo } }); event(geo.enabled ? 'geo-override-enabled' : 'geo-override-disabled'); notify(geo.enabled ? 'Геопозиция применяется на этой вкладке.' : 'Подстановка геопозиции выключена.');
   });
   trusted($('.schedule'), async () => {
+    requireScope();
     const text = $('.scheduled-text').value, timestamp = new Date($('.fire-at').value).getTime();
     if (!composer || !text.trim() || text.length > 10000 || !Number.isFinite(timestamp) || timestamp <= Date.now()) { notify('Нужны текст и время в будущем.', true); return; }
     if ($('.automatic').checked && !env.state()?.settings?.autoSendEnabled) { notify('Сначала отдельно разрешите автоматическую отправку в настройках.', true); return; }
-    await run('schedule', { item: { chatId: key, platform: env.context().platform, text, fireAt: new Date(timestamp).toISOString(), status: 'scheduled',
+    await run('schedule', { item: { chatId: key, accountId: env.context().accountId ?? '', accountScope: env.context().accountScope ?? '', platform: env.context().platform, text, fireAt: new Date(timestamp).toISOString(), status: 'scheduled',
       sendMode: $('.automatic').checked ? 'automatic' : 'review', incomingSnapshot: incomingSnapshot(env.context()) } });
     notify('Запись добавлена в очередь. По умолчанию потребуется ваше действие.');
   });
+  trusted($('.import-loaded'), async () => {
+    if (!current() || !env.context()?.accountId || env.context().platform !== 'tinder') throw new Error('Для импорта нужен проверенный аккаунт и загруженный диалог.');
+    const from = $('.import-from').value ? new Date(`${$('.import-from').value}T00:00:00`).getTime() : null;
+    const to = $('.import-to').value ? new Date(`${$('.import-to').value}T23:59:59.999`).getTime() : null;
+    if ((from !== null && !Number.isFinite(from)) || (to !== null && !Number.isFinite(to)) || (from !== null && to !== null && from > to)) throw new Error('Проверьте диапазон дат.');
+    const filter = JSON.stringify([from, to]); if (filter !== importFilter) { importCursor = 0; importFilter = filter; }
+    $('.import-loaded').disabled = true;
+    try {
+      const receipt = await env.importLoaded({ cursor: importCursor ?? 0, from, to });
+      if (!current()) return;
+      importCursor = receipt.nextCursor;
+      $('.import-receipt').textContent = format('Сохранено диалогов: {{chats}}; сообщений: {{messages}}. Только загруженная часть.', 'Conversations saved: {{chats}}; messages: {{messages}}. Loaded data only.', receipt) + (receipt.unknownDateCount ? ' ' + format('Без известной даты исключено: {{count}}.', 'Excluded without a known date: {{count}}.', { count: receipt.unknownDateCount }) : '') + (receipt.nextCursor !== null ? ' ' + label('Есть следующая порция.') : '');
+      $('.import-loaded').textContent = label(receipt.nextCursor !== null ? 'Импортировать следующую порцию' : 'Повторить импорт');
+    } finally { if (!disposed) $('.import-loaded').disabled = false; }
+  });
   function renderQueue() {
-    const items = active(env.state()?.schedules).filter(item => item.chatId === key && item.platform === env.context()?.platform && ['scheduled', 'ready', 'firing'].includes(item.status));
+    clearTimeout(queueDisplayTimer); queueDisplayTimer = 0;
+    const currentContext = env.context();
+    const items = active(env.state()?.schedules).filter(item => item.platform === currentContext?.platform && (item.accountId ?? '') === (currentContext?.accountId ?? '') && (item.accountScope ?? '') === (currentContext?.accountScope ?? '') && ['scheduled', 'ready', 'firing'].includes(item.status));
     $('.queue').replaceChildren(...items.map(item => {
+      const here = item.chatId === key;
+      const seconds = Math.max(0, Math.ceil((Date.parse(item.fireAt) - Date.now()) / 1000));
+      const state = item.status === 'firing' ? label('Ожидание появления сообщения в истории') : !here ? label('Ожидание открытого диалога') : seconds > 0 ? format('Через {{seconds}} с', 'In {{seconds}} s', { seconds }) : label('Готово к проверке');
       const row = Object.assign(document.createElement('article'), { className: 'queue-item' });
-      const description = Object.assign(document.createElement('p'), { textContent: `${new Date(item.fireAt).toLocaleString(uiLanguage())} · ${item.sendMode === 'automatic' ? label('автоматически') : label('проверка')} · ${item.text}` });
-      const add = button('Подготовить черновик', 'secondary'); trusted(add, () => requestInsertion(item.text));
-      const cancel = button('Отменить', 'secondary'); trusted(cancel, () => run('cancel-schedule', { id: item.id }));
+      const description = Object.assign(document.createElement('p'), { textContent: `${new Date(item.fireAt).toLocaleString(uiLanguage())} · ${item.sendMode === 'automatic' ? label('автоматически') : label('проверка')} · ${state} · ${item.text}` });
+      const add = button(label(here ? 'Подготовить черновик' : 'Открыть диалог'), 'secondary');
+      add.disabled = item.status === 'firing';
+      trusted(add, () => here ? requestInsertion(item.text) : run('open-conversation', { conversation: { platform: item.platform, accountId: item.accountId ?? '', accountScope: item.accountScope ?? '', chatId: item.chatId } }));
+      const cancel = button('Отменить', 'secondary'); cancel.disabled = item.status === 'firing'; trusted(cancel, () => run('cancel-schedule', { id: item.id }));
       row.append(description, add, cancel); return row;
     }));
+    if (!disposed && items.some(item => item.status === 'scheduled' && Date.parse(item.fireAt) > Date.now())) queueDisplayTimer = setTimeout(renderQueue, 1000);
   }
   $('.style').addEventListener('change', () => {
     const style = active(env.state()?.styles).find(style => style.id === $('.style').value && isStyleEligible(style, env.context()));
     if (style) { $('.count').value = String(style.suggestionCount ?? 3); manualCount = false; }
+    updatePhotoPolicy();
   });
+  function updatePhotoPolicy() {
+    const style = active(env.state()?.styles).find(item => item.id === $('.style').value);
+    $('.photo-policy').hidden = !style?.includePhotos;
+    $('.photo-policy').textContent = style?.includePhotos ? label('Для этого стиля рекомендуются фото. Включите прикрепление отдельно для текущего запроса.', 'Photos are recommended for this style. Enable attachment separately for this request.') : '';
+  }
   $('.count').addEventListener('change', () => { manualCount = true; });
   function update() {
     if (!current()) return;
     const context = env.context(), incoming = incomingSnapshot(context), languageChanged = uiLanguage() !== lastLanguage;
     lastLanguage = uiLanguage();
     if (incoming !== lastIncoming) {
-      lastIncoming = incoming; requestNumber++; cancelGeneration?.(); clearPending(); $('.results').replaceChildren(); $('.live-result').textContent = ''; $('.generate').disabled = false; $('.cancel-generation').hidden = true;
+      lastIncoming = incoming; requestNumber++; cancelGeneration?.(); clearPending(); lastReplies = []; $('.append-replies').hidden = true; $('.results').replaceChildren(); $('.live-result').textContent = ''; $('.generate').disabled = false; $('.cancel-generation').hidden = true;
       notify('Появились новые сообщения. Предложите ответы ещё раз.');
     }
     const profileKey = JSON.stringify(context.profile ?? {});
@@ -295,10 +332,12 @@ function createPanel(composer, anchor, env) {
       $('.profile-details').hidden = state.settings?.showProfile === false;
       $('.tools').hidden = state.settings?.showTools === false;
       $('.external-section').hidden = state.settings?.showTools === false;
+      $('.import-section').hidden = state.settings?.showTools === false || context.platform !== 'tinder' || !context.accountId;
       $('.note-section').hidden = state.settings?.showNotes === false;
+      $('.append-replies').hidden = !lastReplies.length || state.settings?.showNotes === false;
       $('.translation-section').hidden = state.settings?.showTranslation === false;
       $('.schedule-section').hidden = !composer || state.settings?.showSchedule === false;
-      if (shadow.activeElement !== $('.note')) $('.note').value = state.notes?.[key]?.text ?? '';
+      if (shadow.activeElement !== $('.note')) $('.note').value = scoped() ? getConversationNote(state, savedConversationFor(state, context) ?? context)?.text ?? '' : '';
       $('.blur').checked = Boolean(state.settings?.blurImages); $('.photos').classList.toggle('blurred', Boolean(state.settings?.blurImages));
       $('.geo-enabled').checked = Boolean(state.settings?.geo?.enabled);
       if (shadow.activeElement !== $('.latitude')) $('.latitude').value = state.settings?.geo?.latitude ?? 0;
@@ -306,29 +345,84 @@ function createPanel(composer, anchor, env) {
       renderQueue();
     }
     if (languageChanged) renderQueue();
+    updatePhotoPolicy();
     localizeUI();
   }
+  const needsScope = initial.platform === 'whatsapp' && !initial.accountId;
+  $('.account-scope').hidden = !needsScope; $('.account-label').value = initial.accountScope ?? '';
+  trusted($('.apply-account-scope'), () => {
+    const scope = $('.account-label').value.trim();
+    if (!scope || scope.length > 100) throw new Error('Нужна локальная метка аккаунта длиной от 1 до 100 символов.');
+    env.setAccountScope(scope);
+  });
   (composer?.closest('form, footer') ?? anchor).insertAdjacentElement('afterend', host);
   if (!composer) { $('.subtitle').textContent = 'Помощник карточки профиля'; $('.schedule-section').hidden = true; }
   update();
-  return { host, composer, anchor, route, key, update, notify, remove() { disposed = true; requestNumber++; cancelGeneration?.(); clearPending(); host.remove(); } };
+  return { host, composer, anchor, route, key, accountId: initial.accountId ?? '', accountScope: initial.accountScope ?? '', update, notify, requestInsertion, pendingConfirmation: () => Boolean(pending), remove() { disposed = true; clearTimeout(queueDisplayTimer); requestNumber++; cancelGeneration?.(); clearPending(); host.remove(); } };
 }
 
 export function start() {
   if (stopCurrent) return stopCurrent;
-  let mounted = null, frame = 0, queueTimer = 0, stopped = false, snapshot = null, library = null, loading = null, reloadAgain = false;
+  let mounted = null, frame = 0, queueTimer = 0, stopped = false, snapshot = null, library = null, loading = null, reloadAgain = false, captureTimer = 0, captureInFlight = false, accountScope = '', queueRunning = false, queueAgain = false;
+  const capturedFingerprints = new Map(), acknowledgements = new Set(), importRequests = new Map();
   const processing = new Set(), platform = platformFor(location);
   if (!platform) return () => {};
   const blurStyle = document.createElement('style');
   blurStyle.textContent = 'html[data-replylab-blur-images="true"] .recsCardboard__cardsContainer [style*="background-image"],html[data-replylab-blur-images="true"] main img[src*="gotinder.com"],html[data-replylab-blur-images="true"] #main header img{filter:blur(16px)!important}';
   document.head.append(blurStyle);
   function context() {
-    if (snapshot?.route === location.pathname && snapshot.conversation) return snapshot.conversation;
+    if (snapshot?.route === location.pathname && snapshot.conversation) return { ...snapshot.conversation, accountScope: platform === 'whatsapp' && !snapshot.conversation.accountId ? accountScope : '' };
     const rendered = renderedContext(document, location);
-    if (rendered) return rendered;
+    if (rendered) return { ...rendered, accountScope: platform === 'whatsapp' && !rendered.accountId ? accountScope : '' };
     if (snapshot?.route === location.pathname && snapshot.profile) return { chatId: `profile:${snapshot.profile.id}`, platform, route: location.pathname,
-      profile: snapshot.profile, photos: snapshot.profile.photos, messages: [], title: snapshot.profile.name || 'Карточка профиля', partial: true, source: snapshot.source };
+      accountId: snapshot.accountId ?? '', accountProfile: snapshot.accountProfile ?? null, profile: snapshot.profile, photos: snapshot.profile.photos, messages: [], title: snapshot.profile.name || 'Карточка профиля', partial: true, source: snapshot.source };
     return null;
+  }
+  function continuousCapture() {
+    clearTimeout(captureTimer); captureTimer = 0;
+    const current = context(), saved = savedConversationFor(library, current);
+    if (stopped || captureInFlight || !saved || current.source !== 'loaded-app-state' || !current.messages.every(message => message.id)) return;
+    const fingerprint = JSON.stringify(portableConversation(current));
+    if (capturedFingerprints.get(saved.id) === fingerprint || !captureChanged(saved, current)) return;
+    const route = location.href;
+    captureTimer = setTimeout(async () => {
+      if (stopped || route !== location.href || !sameConversation(current, context()) || !savedConversationFor(library, context())) return;
+      if (JSON.stringify(portableConversation(context())) !== fingerprint) { continuousCapture(); return; }
+      captureInFlight = true;
+      try { await action('capture', { conversation: portableConversation(context()) }); capturedFingerprints.set(saved.id, fingerprint); }
+      catch (error) { capturedFingerprints.set(saved.id, fingerprint); mounted?.notify(error.message, true); }
+      finally { captureInFlight = false; continuousCapture(); }
+    }, 350);
+  }
+  async function importLoaded(options) {
+    const current = context(), route = location.href;
+    if (!current?.accountId || platform !== 'tinder') throw new Error('Для импорта нужен проверенный аккаунт.');
+    const requestId = crypto.randomUUID();
+    const raw = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { importRequests.delete(requestId); reject(new Error('Страница не ответила на запрос импорта.')); }, 10000);
+      importRequests.set(requestId, { resolve, reject, timer });
+      window.postMessage({ channel, kind: 'import-loaded', requestId, accountId: current.accountId, ...options }, location.origin);
+    });
+    if (route !== location.href || !sameConversation(current, context())) throw new Error('Диалог или аккаунт изменился. Импорт остановлен.');
+    const batch = normalizeLoadedBatch(raw, current.accountId);
+    if (!batch) throw new Error('Страница вернула некорректную порцию диалогов.');
+    let chats = 0, messages = 0;
+    for (const conversation of batch.conversations) {
+      if (stopped || route !== location.href || !sameConversation(current, context())) throw new Error(`Импорт остановлен. Уже сохранено диалогов: ${chats}.`);
+      await action('capture', { conversation: portableConversation(conversation) }); chats++; messages += conversation.messages.length;
+    }
+    return { chats, messages, nextCursor: batch.nextCursor, unknownDateCount: batch.unknownDateCount, partial: true };
+  }
+  function waitForOutgoing(attempt) {
+    return new Promise(resolve => {
+      const check = () => {
+        if (outgoingAcknowledged(context(), attempt)) finish(true);
+        else if (stopped || !sameConversation(context(), attempt)) finish(false);
+      };
+      const timer = setTimeout(() => finish(false), 15000);
+      const finish = value => { clearTimeout(timer); acknowledgements.delete(check); resolve(value); };
+      acknowledgements.add(check); check();
+    });
   }
   async function action(action, payload = {}) {
     const response = await chrome.runtime.sendMessage({ type: 'replylab:action', action, payload });
@@ -350,11 +444,15 @@ export function start() {
     return loading;
   }
   async function processQueue() {
+    if (queueRunning) { queueAgain = true; return; }
+    queueRunning = true;
+    try {
     clearTimeout(queueTimer); queueTimer = 0;
     const current = context();
     if (!current || !library || document.visibilityState !== 'visible') return;
-    const due = active(library.schedules).filter(item => item.chatId === current.chatId && item.platform === current.platform && item.status === 'scheduled');
+    const due = active(library.schedules).filter(item => sameConversation(item, current) && item.status === 'scheduled');
     for (const item of due.filter(item => Date.parse(item.fireAt) <= Date.now())) {
+      if (!sameConversation(current, context()) || document.visibilityState !== 'visible') break;
       if (processing.has(item.id)) continue;
       processing.add(item.id);
       let claimed = false, claimAttempted = false;
@@ -365,7 +463,7 @@ export function start() {
         if (!composer || draftText(composer).length) { await action('complete-schedule', { id: item.id, status: 'ready', error: 'В поле уже есть черновик.' }); continue; }
         if (item.incomingSnapshot !== incomingSnapshot(context())) throw new Error('Входящие сообщения изменились. Автоматическая отправка отменена.');
         claimAttempted = true;
-        const response = await action('claim-schedule', { id: item.id, chatId: current.chatId, incomingSnapshot: incomingSnapshot(context()),
+        const response = await action('claim-schedule', { id: item.id, platform: current.platform, accountId: current.accountId, chatId: current.chatId, incomingSnapshot: incomingSnapshot(context()),
           expected: { fireAt: item.fireAt, text: item.text, updatedAt: item.updatedAt } });
         claimed = true;
         const actual = response.state?.schedules.find(record => record.id === item.id);
@@ -379,8 +477,12 @@ export function start() {
         if (!library.settings?.autoSendEnabled || document.visibilityState !== 'visible' || context()?.chatId !== current.chatId || item.incomingSnapshot !== incomingSnapshot(context()) || draftText(composer) !== item.text) throw new Error('Черновик, входящее сообщение или разрешение изменились.');
         const send = findSendButton(composer);
         if (!send) throw new Error('Кнопка отправки не найдена однозначно. Черновик оставлен для проверки.');
+        const attempt = { platform: current.platform, accountId: current.accountId, chatId: current.chatId, text: item.text, after: Date.now(), knownIds: (context().messages ?? []).map(message => message.id).filter(Boolean) };
         send.click();
-        await action('complete-schedule', { id: item.id, status: 'completed', error: 'Команда отправки выполнена. Проверьте подтверждение в диалоге; автоматически не повторяем.' });
+        const observed = await waitForOutgoing(attempt);
+        await action('complete-schedule', { id: item.id, status: observed ? 'sent' : 'completed',
+          error: observed ? '' : 'Появление сообщения в истории не подтверждено за 15 секунд. Проверьте вручную; автоматически не повторяем.' });
+        mounted?.notify(observed ? 'Исходящее сообщение появилось в истории. Доставка собеседнику не проверяется.' : 'Результат отправки не подтверждён. Проверьте историю вручную.');
       } catch (error) {
         if (!claimAttempted || claimed) await action('complete-schedule', { id: item.id, status: 'failed', error: error.message }).catch(() => {});
         mounted?.notify(error.message, true);
@@ -390,14 +492,15 @@ export function start() {
     }
     const future = due.map(item => Date.parse(item.fireAt)).filter(time => time > Date.now());
     if (future.length) queueTimer = setTimeout(() => { loadLibrary().then(processQueue); }, Math.min(Math.min(...future) - Date.now() + 20, 2147483647));
+    } finally { queueRunning = false; if (queueAgain) { queueAgain = false; schedule(); } }
   }
   function scan() {
     frame = 0;
     if (stopped) return;
     const composer = findComposer(document, location), anchor = composer ?? findProfileAnchor(document, location), data = context();
-    if (mounted && (mounted.composer !== composer || mounted.anchor !== anchor || mounted.route !== location.href || mounted.key !== (data?.chatId ?? '') || !mounted.host.isConnected)) { mounted.remove(); mounted = null; }
-    if (!mounted && anchor && data) mounted = createPanel(composer, anchor, { context, state: () => library, action, schedule });
-    mounted?.update(); processQueue().catch(() => {});
+    if (mounted && (mounted.composer !== composer || mounted.anchor !== anchor || mounted.route !== location.href || mounted.key !== (data?.chatId ?? '') || mounted.accountId !== (data?.accountId ?? '') || mounted.accountScope !== (data?.accountScope ?? '') || !mounted.host.isConnected)) { mounted.remove(); mounted = null; }
+    if (!mounted && anchor && data) mounted = createPanel(composer, anchor, { context, state: () => library, action, schedule, importLoaded, captureSaved: continuousCapture, setAccountScope(value) { accountScope = value; mounted?.remove(); mounted = null; schedule(); } });
+    mounted?.update(); for (const check of acknowledgements) check(); continuousCapture(); processQueue().catch(() => {});
   }
   function schedule() { if (!stopped && !frame) frame = requestAnimationFrame(scan); }
   const observer = new MutationObserver(schedule);
@@ -407,6 +510,11 @@ export function start() {
     if (event.source !== window || event.origin !== location.origin || event.data?.channel !== channel) return;
     if (event.data.kind === 'geo-request' && ['getCurrentPosition', 'watchPosition'].includes(event.data.operation)) {
       action('record-event', { event: { kind: `geolocation:${event.data.operation}:${event.data.overridden === true ? 'override' : 'native'}`, platform, chatId: context()?.chatId ?? '', at: new Date().toISOString() } }).catch(() => {});
+      return;
+    }
+    if (event.data.kind === 'import-result') {
+      const pending = importRequests.get(event.data.requestId);
+      if (pending) { importRequests.delete(event.data.requestId); clearTimeout(pending.timer); event.data.ok ? pending.resolve(event.data) : pending.reject(new Error(event.data.error || 'Импорт не получен.')); }
       return;
     }
     if (event.data.kind !== 'snapshot') return;
@@ -421,14 +529,24 @@ export function start() {
     const kind = /^(nope|pass|dislike|не нравится|пропустить)(?:\s|$|\()/.test(label) ? 'pass-observed' : /^(like|нравится)(?:\s|$|\()/.test(label) ? 'like-observed' : null;
     if (kind) action('record-event', { event: { kind, platform, chatId: context()?.chatId ?? '', at: new Date().toISOString(), ...(context()?.profile ? { profile: context().profile } : {}) } }).catch(() => {});
   };
+  const onRuntime = (message, sender, respond) => {
+    if (sender.id !== chrome.runtime.id || !['replylab:identify', 'replylab:insert-draft'].includes(message?.type)) return false;
+    const current = context();
+    if (message.type === 'replylab:identify') { respond({ ok: true, platform, accountId: current?.accountId ?? '', accountScope: current?.accountScope ?? '', chatId: current?.chatId ?? '', visible: document.visibilityState === 'visible', route: location.pathname }); return false; }
+    if (!current?.accountId || !sameConversation(current, message.expected) || !mounted || !mounted.host.isConnected || mounted.route !== location.href || mounted.key !== current.chatId || mounted.accountId !== current.accountId || mounted.accountScope !== (current.accountScope ?? '') || document.visibilityState !== 'visible' || mounted.composer !== findComposer(document, location) || typeof message.text !== 'string' || !message.text.trim() || message.text.length > 10000) { respond({ ok: false, error: 'Открытый диалог не совпадает с выбранным.' }); return false; }
+    mounted.requestInsertion(message.text); respond({ ok: true, pendingConfirmation: mounted.pendingConfirmation() }); return false;
+  };
+  chrome.runtime.onMessage?.addListener(onRuntime);
   window.addEventListener('message', onMessage); document.addEventListener('click', onSwipe, true); chrome.storage.onChanged.addListener(onStorage);
   const events = ['popstate', 'hashchange', 'pageshow', 'resize', 'visibilitychange'];
   events.forEach(event => window.addEventListener(event, schedule)); document.addEventListener('focusin', schedule);
   window.navigation?.addEventListener('currententrychange', schedule);
   stopCurrent = () => {
     if (stopped) return;
-    stopped = true; observer.disconnect(); cancelAnimationFrame(frame); clearTimeout(queueTimer); mounted?.remove(); blurStyle.remove();
+    stopped = true; observer.disconnect(); cancelAnimationFrame(frame); clearTimeout(queueTimer); clearTimeout(captureTimer); for (const check of acknowledgements) check();
+    for (const pending of importRequests.values()) { clearTimeout(pending.timer); pending.reject(new Error('Импорт остановлен.')); } importRequests.clear(); mounted?.remove(); blurStyle.remove();
     document.documentElement.removeAttribute('data-replylab-blur-images'); window.postMessage({ channel, kind: 'geo', value: { enabled: false } }, location.origin);
+    chrome.runtime.onMessage?.removeListener(onRuntime);
     window.removeEventListener('message', onMessage); document.removeEventListener('click', onSwipe, true); chrome.storage.onChanged.removeListener(onStorage);
     events.forEach(event => window.removeEventListener(event, schedule)); document.removeEventListener('focusin', schedule);
     window.navigation?.removeEventListener('currententrychange', schedule); stopCurrent = null;

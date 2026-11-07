@@ -10,6 +10,19 @@ async function requirePermission(origin, canConnect) {
   if (globalThis.chrome?.permissions?.contains && !await chrome.permissions.contains({ origins: [permissionFor(origin)] })) throw new Error('Доступ к этому серверу не разрешён.');
 }
 
+const ERROR_CODES = new Set(['length', 'content-filter', 'auth', 'rate-limit', 'upstream', 'incomplete', 'invalid-output']);
+function responseError(data, status) {
+  const error = new Error(typeof data?.error === 'string' ? data.error : `Сервер вернул HTTP ${status}.`);
+  if (ERROR_CODES.has(data?.code)) error.code = data.code;
+  if (typeof data?.retryable === 'boolean') error.retryable = data.retryable;
+  return error;
+}
+
+async function responseJson(response) {
+  try { return await response.json(); }
+  catch { throw new Error(`Сервер вернул некорректный JSON (HTTP ${response.status}).`); }
+}
+
 export async function serverRequest(route, { settings = {}, token = '', method = 'GET', body, signal, fetchImpl = fetch, canConnect = false } = {}) {
   const origin = serverOrigin(settings.serverUrl);
   await requirePermission(origin, canConnect);
@@ -17,8 +30,8 @@ export async function serverRequest(route, { settings = {}, token = '', method =
   const response = await fetchImpl(origin + route, { method,
     headers: { 'X-ReplyLab': '1', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }), redirect: 'error', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(100000)]) : AbortSignal.timeout(100000) });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `Сервер вернул HTTP ${response.status}.`);
+  const data = await responseJson(response);
+  if (!response.ok) throw responseError(data, response.status);
   return data;
 }
 
@@ -28,7 +41,7 @@ export async function streamServer(body, options, onEvent) {
   const response = await (options.fetchImpl ?? fetch)(origin + '/stream', { method: 'POST', redirect: 'error',
     headers: { 'Content-Type': 'application/json', 'X-ReplyLab': '1', ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}) },
     body: JSON.stringify(body), signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(100000)]) : AbortSignal.timeout(100000) });
-  if (!response.ok) { const data = await response.json(); throw new Error(data.error || `HTTP ${response.status}`); }
+  if (!response.ok) throw responseError(await responseJson(response), response.status);
   if (!response.body) throw new Error('Сервер не открыл поток.');
   const decoder = new TextDecoder(); let buffer = ''; let result; let done = false;
   for await (const part of response.body) {
@@ -40,7 +53,7 @@ export async function streamServer(body, options, onEvent) {
       const line = block.split(/\r?\n/).filter(value => value.startsWith('data:')).map(value => value.slice(5).trimStart()).join('\n');
       if (!line) continue;
       const event = JSON.parse(line);
-      if (event.type === 'error') throw new Error(event.error || 'Ошибка потока.');
+      if (event.type === 'error') throw responseError(event, response.status);
       if (event.type === 'delta') onEvent?.(event);
       if (event.type === 'result') result = Object.fromEntries(Object.entries(event).filter(([key]) => key !== 'type'));
       if (event.type === 'done') done = true;

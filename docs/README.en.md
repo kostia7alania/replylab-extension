@@ -4,7 +4,7 @@ Inline reply helpers for Tinder and WhatsApp Web, with custom styles, conversati
 
 [Русская инструкция](../README.md) · [Capabilities and verification](features.md) · [Research and limitations (RU)](research.ru.md)
 
-**[Download 0.3.0](https://github.com/kostia7alania/replylab-extension/releases/latest/download/ReplyLab-0.3.0.zip)**
+**[Download 0.4.0](https://github.com/kostia7alania/replylab-extension/releases/latest/download/ReplyLab-0.4.0.zip)**
 
 ![Synthetic chat fixture](images/inline.png)
 
@@ -38,8 +38,10 @@ API keys and OAuth credentials stay on your server. Library exports exclude them
 
 ## Behavior and limits
 
-Custom styles, notes, memories, assistant chats, imported conversations, analytics and scheduling share one validated local library. Optional sync, search and expiring share links use your server. Only loaded conversation history can be captured. Photo upload is an explicit per-request choice. Replacing a draft requires confirmation.
+Custom styles, notes, memories, assistant chats, imported conversations, analytics and scheduling share one validated local library. Optional sync, search and expiring share links use your server. Only loaded conversation history can be captured. After explicitly saving a chat with a known account, loaded updates to that exact chat are merged locally. For unverified WhatsApp accounts, archive data is separated by a local account label that you choose explicitly. Photo upload is an explicit per-request choice. Replacing a draft requires confirmation.
 
 Automatic sending starts disabled and requires separate consent on each device. It only attempts explicitly marked automatic items in a visible matching conversation with unchanged incoming messages and no existing draft. WhatsApp automatic sending stays blocked until a reliable self-account identity source is verified. Platform rules can restrict third-party integrations; no ban-free guarantee is offered. [Primary sources](research.ru.md#почему-паузы-не-дают-защиты-от-блокировки).
 
 Validation: `npm test`. The optional `tests/browser.mjs` exercises the actual extension worker and HTTP server against synthetic site state and mocked AI transport. Live account compatibility and live OAuth access remain separate checks.
+
+Version 0.4 adds rich owner/person profiles, structured assistant cards, reviewed style drafts, account-scoped history search and notes, versioned server catalogs/templates, forked assistant edits, and bounded import of already-loaded chats. A real local qwen3.5:4b request was also verified through the extension UI; live platform accounts remain a separate gate.

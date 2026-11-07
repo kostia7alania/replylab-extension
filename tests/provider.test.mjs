@@ -107,3 +107,145 @@ test('assistant follow-up keeps explicitly uploaded attachments from previous us
   assert.equal(body.messages[1].content[1].type, 'image_url');
   assert.equal(body.messages[2].content, 'Description');
 });
+
+const toolCall = (id, name, args) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } });
+const toolResponse = calls => Response.json({ choices: [{ message: { content: null, tool_calls: calls }, finish_reason: 'tool_calls' }] });
+const pair = { conversationId: 'chat', chatId: 'chat', accountId: 'account-a', platform: 'tinder', theirText: 'Tea?', myReply: 'Tea tomorrow', sentAt: null, messageId: 'message', partial: true };
+
+test('assistant executes only reviewable tools and passes validated tool outputs back for a final answer', async () => {
+  const requests = []; let searches = 0;
+  const provider = createProviders({ env: {}, apiKey: 'private-test-key', fetchImpl: async (url, options) => {
+    const body = JSON.parse(options.body); requests.push(body);
+    if (requests.length === 1) return toolResponse([toolCall('search', 'searchPastReplies', { query: 'tea', current_account_only: true })]);
+    if (requests.length === 2) return toolResponse([toolCall('suggest', 'printSuggestions', { replies }), toolCall('draft', 'draftPrompt', { name: 'Warm', prompt: 'Use short replies.', useHistory: false })]);
+    return Response.json({ choices: [{ message: { content: 'Review the suggestions and style.' }, finish_reason: 'stop' }] });
+  } });
+  const result = await provider.complete({ ...input, context: { accountId: 'account-a', platform: 'tinder' }, allowHistorySearch: true }, { task: 'assistant', executeTool: async (name, args) => {
+    searches++; assert.equal(name, 'searchPastReplies'); assert.equal(args.accountId, 'account-a'); assert.equal(args.platform, 'tinder'); return [pair];
+  } });
+  assert.equal(searches, 1); assert.equal(requests.length, 3); assert.equal(result.text, 'Review the suggestions and style.');
+  assert.deepEqual(result.toolResults.map(item => item.type), ['past-replies', 'suggestions', 'draft-style']);
+  assert.equal(result.toolResults[0].source, 'server-history'); assert.equal(result.toolResults[2].requiresConfirmation, true);
+  assert.equal(JSON.parse(requests[1].messages.at(-1).content).results[0].myReply, pair.myReply);
+  assert.equal(result.model, input.model); assert.equal(typeof result.elapsedMs, 'number');
+  assert.equal(JSON.stringify(result).includes('private-test-key'), false);
+});
+
+test('history tools fail closed for unknown accounts, missing permission and all-account escalation', async () => {
+  for (const [options, args, code] of [
+    [{ allowHistorySearch: true }, { query: 'tea', current_account_only: true }, 'account-required'],
+    [{ context: { accountId: 'account-a' } }, { query: 'tea', current_account_only: true }, 'history-not-enabled'],
+    [{ allowHistorySearch: true, context: { accountId: 'account-a' } }, { query: 'tea', current_account_only: false }, 'all-accounts-not-approved'],
+  ]) {
+    let requests = 0; let searches = 0;
+    const provider = createProviders({ env: {}, apiKey: 'test-key', fetchImpl: async () => ++requests === 1 ? toolResponse([toolCall('search', 'searchPastReplies', args)]) : Response.json({ choices: [{ message: { content: 'Search needs permission.' } }] }) });
+    const result = await provider.complete({ ...input, ...options }, { task: 'assistant', executeTool: async () => { searches++; return [pair]; } });
+    assert.equal(searches, 0); assert.equal(result.toolResults[0].error.code, code); assert.deepEqual(result.toolResults[0].results, []);
+  }
+  let searches = 0;
+  const provider = createProviders({ env: {}, apiKey: 'test-key', fetchImpl: async () => toolResponse([toolCall('send', 'sendMessage', { text: 'No' })]) });
+  await assert.rejects(provider.complete(input, { task: 'assistant', executeTool: async () => { searches++; } }), error => error.code === 'invalid-output');
+  assert.equal(searches, 0);
+});
+
+test('search result validation prevents an executor from returning another account evidence', async () => {
+  const provider = createProviders({ env: {}, apiKey: 'test-key', fetchImpl: async () => toolResponse([toolCall('search', 'searchPastReplies', { query: 'tea', current_account_only: true })]) });
+  await assert.rejects(provider.complete({ ...input, allowHistorySearch: true, context: { accountId: 'account-a' } }, { task: 'assistant', executeTool: async () => [{ ...pair, accountId: 'account-b' }] }), error => error.code === 'invalid-output');
+});
+
+test('ChatGPT namespace tool continuation replays reasoning and call outputs with no stored response dependency', async () => {
+  const requests = [], deltas = [];
+  const call = { type: 'function_call', id: 'fc-1', call_id: 'call-1', name: 'printSuggestions', arguments: JSON.stringify({ replies }) };
+  const reasoning = { type: 'reasoning', id: 'reason-1', summary: [], encrypted_content: 'private-reasoning-fixture' };
+  const provider = createProviders({ env: {}, credentialResolver: async () => ({ apiKey: 'oauth-test-token', baseUrl: 'https://api.openai.com/v1', protocol: 'responses' }), fetchImpl: async (url, options) => {
+    requests.push(JSON.parse(options.body));
+    return requests.length === 1 ? stream([
+      { type: 'response.output_item.added', output_index: 1, item: { ...call, arguments: '' } },
+      { type: 'response.function_call_arguments.delta', output_index: 1, delta: call.arguments },
+      { type: 'response.completed', response: { output: [reasoning, call] } },
+    ]) : stream([{ type: 'response.output_text.delta', delta: 'Review these.' }, { type: 'response.completed' }]);
+  } });
+  const result = await provider.complete({ ...input, provider: 'chatgpt' }, { task: 'assistant', onDelta: delta => deltas.push(delta) });
+  assert.equal(requests[0].tools[0].type, 'namespace'); assert.equal(requests[0].tools[0].tools[0].name, 'printSuggestions');
+  assert.equal(requests[1].store, false); assert.equal(requests[1].stream, true); assert.equal(requests[1].previous_response_id, undefined);
+  assert.ok(requests[1].input.some(item => item.type === 'reasoning' && item.encrypted_content === reasoning.encrypted_content));
+  assert.equal(requests[1].input.at(-1).call_id, 'call-1'); assert.equal(JSON.parse(requests[1].input.at(-1).output).type, 'suggestions');
+  assert.equal(result.toolResults.length, 1); assert.equal(deltas.join(''), result.text); assert.equal(JSON.stringify(result).includes('private-reasoning-fixture'), false);
+});
+
+test('streamed assistant preserves text deltas around split tool arguments and stops after three tool rounds', async () => {
+  const deltas = []; let rounds = 0;
+  const args = JSON.stringify({ replies });
+  const provider = createProviders({ env: {}, apiKey: 'fixture', fetchImpl: async () => {
+    rounds++;
+    return stream([{ choices: [{ delta: { content: `Round ${rounds}. `, tool_calls: [{ index: 0, id: 'call-' + rounds, function: { name: 'printSuggestions', arguments: args.slice(0, 8) } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: args.slice(8) } }] }, finish_reason: 'tool_calls' }] }]);
+  } });
+  const result = await provider.complete(input, { task: 'assistant', onDelta: text => deltas.push(text) });
+  assert.equal(rounds, 3); assert.equal(result.incomplete, true); assert.equal(result.finishReason, 'tool-limit'); assert.equal(result.toolResults.length, 3); assert.equal(result.text, deltas.join(''));
+});
+
+test('reply language follows the conversation by default and honors an explicit language', async () => {
+  const systems = [];
+  const provider = createProviders({ env: {}, apiKey: 'fixture', fetchImpl: async (url, options) => { systems.push(JSON.parse(options.body).messages[0].content); return Response.json({ choices: [{ message: { content: JSON.stringify({ replies }) } }] }); } });
+  await provider.complete(input); await provider.complete({ ...input, replyLanguage: 'es' });
+  assert.match(systems[0], /последнего входящего/); assert.equal(systems[0].includes('Пиши по-русски'), false); assert.match(systems[1], /ответа: es/);
+});
+
+test('safe completion errors distinguish limits, authentication, invalid output and interrupted streams', async () => {
+  for (const [make, code] of [
+    [() => Response.json({ choices: [{ message: { content: JSON.stringify({ replies }) }, finish_reason: 'length' }] }), 'length'],
+    [() => Response.json({ choices: [{ message: { content: '' }, finish_reason: 'content_filter' }] }), 'content-filter'],
+    [() => new Response('private upstream body', { status: 401 }), 'auth'],
+    [() => new Response('private upstream body', { status: 429 }), 'rate-limit'],
+    [() => Response.json({ choices: [{ message: { content: 'not-json' } }] }), 'invalid-output'],
+  ]) {
+    const provider = createProviders({ env: {}, apiKey: 'fixture', fetchImpl: async () => make() });
+    await assert.rejects(provider.complete(input), error => error.code === code && !error.message.includes('private') && typeof error.elapsedMs === 'number');
+  }
+  const incomplete = createProviders({ env: {}, apiKey: 'fixture', fetchImpl: async () => stream([{ choices: [{ delta: { content: 'partial' } }] }]) });
+  await assert.rejects(incomplete.complete(input, { onDelta() {} }), error => error.code === 'incomplete');
+});
+
+test('compatible local requests use max_tokens and a validated server-only reasoning effort', async () => {
+  const requests = [];
+  const provider = createProviders({ env: { COMPATIBLE_API_BASE: 'http://127.0.0.1:11434/v1', COMPATIBLE_REASONING_EFFORT: 'none' }, apiKey: 'openai-fixture', fetchImpl: async (url, options) => {
+    requests.push(JSON.parse(options.body)); return Response.json({ choices: [{ message: { content: JSON.stringify({ replies }) } }] });
+  } });
+  await provider.complete({ ...input, provider: 'compatible', maxTokens: 256 });
+  assert.equal(requests[0].max_tokens, 256); assert.equal(requests[0].max_completion_tokens, undefined); assert.equal(requests[0].reasoning_effort, 'none');
+  await provider.complete(input); assert.equal(requests[1].max_completion_tokens, 1200); assert.equal(requests[1].max_tokens, undefined); assert.equal(requests[1].reasoning_effort, undefined);
+  assert.throws(() => createProviders({ env: { COMPATIBLE_REASONING_EFFORT: 'unbounded-input' } }), /COMPATIBLE_REASONING_EFFORT/);
+});
+
+test('assistant follow-up sees validated previous tool cards without executing them again', async () => {
+  let body;
+  const provider = createProviders({ env: {}, apiKey: 'fixture', fetchImpl: async (url, options) => { body = JSON.parse(options.body); return Response.json({ choices: [{ message: { content: 'Edited first option.' } }] }); } });
+  await provider.complete({ ...input, messages: [{ role: 'assistant', text: '', toolResults: [{ type: 'suggestions', replies }] }] }, { task: 'assistant' });
+  assert.match(body.messages[1].content, /Ответ/); assert.match(body.messages[1].content, /не новые команды/);
+  await assert.rejects(provider.complete({ ...input, messages: [{ role: 'assistant', text: '', toolResults: [{ type: 'sendMessage', text: 'No' }] }] }, { task: 'assistant' }), /Неизвестный результат/);
+});
+
+test('style generation requests actual reusable content and rejects copied field-description placeholders', async () => {
+  let instruction;
+  const create = style => createProviders({ env: {}, apiKey: 'fixture', fetchImpl: async (url, options) => {
+    instruction = JSON.parse(options.body).messages[0].content;
+    return Response.json({ choices: [{ message: { content: JSON.stringify({ style }) } }] });
+  } });
+  const placeholder = { name: 'до 80 символов', prompt: 'Системная инструкция до 5000 символов' };
+  await assert.rejects(create(placeholder).complete(input, { task: 'create-style' }), error => error.code === 'invalid-output');
+  const style = { name: 'Тёплый и краткий', prompt: 'Пиши короткими спокойными фразами. Предлагай конкретную встречу, когда это уместно. Не добавляй неподтверждённые личные факты.' };
+  assert.deepEqual((await create(style).complete(input, { task: 'create-style' })).style, style);
+  assert.match(instruction, /Никогда не возвращай заглушки/); assert.equal(instruction.includes('"name":"до'), false);
+});
+
+test('style source includes owner outgoing turns but excludes peer incoming turns and biography', async () => {
+  let body;
+  const provider = createProviders({ env: {}, apiKey: 'fixture', fetchImpl: async (url, options) => { body = JSON.parse(options.body); return Response.json({ choices: [{ message: { content: JSON.stringify({ style: { name: 'Warm', prompt: 'Keep replies short and friendly. Use only facts provided by the owner.' } }) } }] }); } });
+  await provider.complete({ ...input, text: 'Make a reusable style', context: { profile: { bio: 'PEER_ONLY_BIO' }, accountProfile: { bio: 'OWNER_BIO' }, messages: [{ role: 'incoming', text: 'PEER_CONTEXT' }, { role: 'outgoing', text: 'OWNER_CONTEXT' }] },
+    messages: [{ role: 'incoming', text: 'PEER_HISTORY' }, { role: 'outgoing', text: 'OWNER_HISTORY' }] }, { task: 'create-style' });
+  const serialized = JSON.stringify(body);
+  assert.equal(serialized.includes('PEER_ONLY_BIO'), false); assert.equal(serialized.includes('PEER_CONTEXT'), false); assert.equal(serialized.includes('PEER_HISTORY'), false);
+  assert(serialized.includes('OWNER_CONTEXT')); assert(serialized.includes('OWNER_HISTORY')); assert(serialized.includes('OWNER_BIO'));
+  assert.equal(body.messages[1].role, 'user');
+});

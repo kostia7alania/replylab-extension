@@ -26,22 +26,41 @@ export function objectIdTimestamp(id, now = Date.now()) {
 
 export function normalizeProfile(raw = {}, now = Date.now()) {
   raw = raw && typeof raw === 'object' ? raw : {};
-  const id = identifier(raw._id ?? raw.id);
-  const photos = [...new Set((Array.isArray(raw.photos) ? raw.photos : []).flatMap(photo => {
-    if (typeof photo === 'string') return [photo];
-    return [photo?.url, ...(Array.isArray(photo?.processedFiles) ? photo.processedFiles : []).map(file => file?.url)];
-  }).map(photoUrl).filter(Boolean))];
-  return {
-    id,
-    name: text(raw.name ?? raw.personName),
-    bio: text(raw.bio),
-    photos,
+  let richPartial = raw.richPartial !== false;
+  const bounded = (value, max) => { const result = text(value); if (result.length > max) richPartial = true; return result.slice(0, max); };
+  const list = (value, max) => { if (!Array.isArray(value)) return []; if (value.length > max) richPartial = true; return value.slice(0, max); };
+  const id = bounded(identifier(raw._id ?? raw.id), 150);
+  const photos = [...new Set(list(raw.photos, 20).filter(photo => !photo?.is_video && photo?.type !== 'video').map(photo =>
+    typeof photo === 'string' ? photo : photo?.processedFiles?.[0]?.url || photo?.url).map(photoUrl).filter(Boolean))];
+  const interests = list(raw.interests ?? raw.user_interests?.selected_interests, 100)
+    .map(value => bounded(typeof value === 'string' ? value : value?.name, 200)).filter(Boolean);
+  const descriptors = list(raw.descriptors ?? raw.selected_descriptors, 100).map(value => {
+    const measurement = value?.measurable_selection;
+    const selected = Array.isArray(value?.choice_selections) ? value.choice_selections.map(choice => text(choice?.name)).filter(Boolean).join(', ') : '';
+    const measured = measurement && (typeof measurement.value === 'number' || typeof measurement.value === 'string')
+      ? [String(measurement.value), text(measurement.unit_of_measure)].filter(Boolean).join(' ') : '';
+    return { id: bounded(identifier(value?.id), 150), name: bounded(value?.name, 200),
+      type: value?.type == null ? null : bounded(value.type, 100), value: bounded(value?.value ?? (measured || selected), 1000) };
+  });
+  const userPrompts = list(raw.userPrompts ?? raw.user_prompts?.prompts, 50).map(value => ({
+    id: bounded(identifier(value?.id), 150), question: bounded(value?.question ?? value?.question_text, 1000), answer: bounded(value?.answer ?? value?.answer_text, 10000),
+  }));
+  const track = raw.spotify?.themeTrack ?? raw.spotify?.spotify_theme_track;
+  const themeTrack = track && typeof track === 'object' ? { name: bounded(track.name, 300),
+    artists: list(track.artists, 30).map(artist => bounded(typeof artist === 'string' ? artist : artist?.name, 200)).filter(Boolean) } : null;
+  const profile = {
+    id, name: bounded(raw.name ?? raw.personName, 150), bio: bounded(raw.bio, 10000), photos,
     birthDate: iso(raw.birth_date ?? raw.birthDate),
     age: Number.isFinite(raw.age) && raw.age >= 18 && raw.age <= 120 ? raw.age : null,
-    city: text(typeof raw.city === 'object' ? raw.city?.name : raw.city),
-    distanceKm: Number.isFinite(raw.distance_mi) ? Math.round(raw.distance_mi * 1.609344) : null,
-    idTimestamp: objectIdTimestamp(id, now),
+    city: bounded(typeof raw.city === 'object' ? raw.city?.name : raw.city, 150),
+    distanceKm: Number.isFinite(raw.distanceKm) && raw.distanceKm >= 0 && raw.distanceKm <= 50000 ? raw.distanceKm : Number.isFinite(raw.distance_mi) && raw.distance_mi >= 0 && raw.distance_mi * 1.609344 <= 50000 ? Math.round(raw.distance_mi * 1.609344) : null,
+    idTimestamp: raw.idTimestamp === null ? null : objectIdTimestamp(id, now), interests, descriptors, userPrompts, spotify: { themeTrack }, richPartial,
   };
+  // Keep the portable profile under the library's 200 KB limit, reporting any loss.
+  for (const key of ['userPrompts', 'descriptors', 'interests', 'photos']) {
+    while (JSON.stringify(profile).length > 190000 && profile[key].length) { profile[key].pop(); profile.richPartial = true; }
+  }
+  return profile;
 }
 
 function tinderMessage(raw, selfId) {
@@ -66,7 +85,7 @@ export function conversationFromTinder(state, route, now = Date.now()) {
   const profile = normalizeProfile(rawProfile, now);
   const messages = rawMessages.slice(-500).map(message => tinderMessage(message, selfId)).filter(Boolean);
   const omittedMessages = Math.max(0, (match.loadedMessageCount ?? rawMessages.length) - messages.length);
-  return { chatId, accountId: selfId, platform: 'tinder', route, profile, photos: profile.photos, messages,
+  return { chatId, accountId: selfId, accountProfile: selfId ? normalizeProfile(state.profile.user, now) : null, platform: 'tinder', route, profile, photos: profile.photos, messages,
     currentReliable: Boolean(selfId && state.routing.pathname === route && messages.every(message => message.role !== 'unknown')),
     partial: true, source: 'loaded-app-state', omittedMessages,
     title: profile.name || 'Открытый диалог' };
@@ -78,12 +97,64 @@ export function conversationFromWhatsApp(raw, route) {
   const profile = normalizeProfile({ id: raw.personId, name: raw.name ?? raw.personName,
     photos: raw.personProfilePicUrl ? [raw.personProfilePicUrl] : [] });
   const loaded = Array.isArray(raw.messages) ? raw.messages : [];
-  return { chatId, accountId: '', platform: 'whatsapp', route, profile, photos: profile.photos,
+  return { chatId, accountId: '', accountProfile: null, platform: 'whatsapp', route, profile, photos: profile.photos,
     messages: loaded.slice(-500).map(message => ({ id: identifier(message.id), role: message.isFromMe === true ? 'user' : message.isFromMe === false ? 'assistant' : 'unknown',
       text: text(message.body), createdAt: iso(typeof message.ts_sec === 'number' ? message.ts_sec * 1000 : message.createdAt),
       attachment: message.type && message.type !== 'chat' ? text(message.type) : null })),
     currentReliable: loaded.every(message => typeof message.isFromMe === 'boolean'),
     partial: true, source: 'loaded-app-state', omittedMessages: Math.max(0, (raw.loadedMessageCount ?? loaded.length) - 500), title: profile.name || 'Открытый диалог' };
+}
+
+export function sameConversation(left, right) {
+  return Boolean(left && right && left.platform === right.platform && (left.accountId ?? '') === (right.accountId ?? '') && (left.accountScope ?? '') === (right.accountScope ?? '') && left.chatId === right.chatId);
+}
+
+export function portableConversation(context) {
+  return { chatId: context.chatId, accountId: context.accountId ?? '', accountScope: context.accountScope ?? '', platform: context.platform, title: context.title,
+    profile: normalizeProfile(context.profile), accountProfile: context.accountProfile ? normalizeProfile(context.accountProfile) : null,
+    photos: (context.photos ?? []).slice(0, 20), partial: true,
+    messages: (context.messages ?? []).map(({ id, role, text, createdAt }) => ({ id, role, text, createdAt: createdAt ?? null })) };
+}
+
+export function savedConversationFor(state, context) {
+  if (!context?.accountId) return null;
+  return (state?.conversations ?? []).find(record => !record.deleted && sameConversation(record, context)) ?? null;
+}
+
+export function captureChanged(saved, context) {
+  if (!saved || !sameConversation(saved, context)) return false;
+  const next = portableConversation(context);
+  if (JSON.stringify(next.profile) !== JSON.stringify(normalizeProfile(saved.profile))
+    || JSON.stringify(next.accountProfile) !== JSON.stringify(saved.accountProfile ? normalizeProfile(saved.accountProfile) : null)) return true;
+  const byId = new Map((saved.messages ?? []).filter(message => message.id).map(message => [message.id, message]));
+  return next.messages.some(message => !message.id || JSON.stringify(message) !== JSON.stringify(byId.get(message.id) && {
+    id: byId.get(message.id).id, role: byId.get(message.id).role, text: byId.get(message.id).text, createdAt: byId.get(message.id).createdAt ?? null,
+  }));
+}
+
+export function outgoingAcknowledged(context, attempt) {
+  if (!sameConversation(context, attempt) || !context?.accountId || !context.currentReliable || context.source !== 'loaded-app-state') return false;
+  return (context.messages ?? []).some(message => {
+    if (!['user', 'outgoing'].includes(message.role) || message.text !== attempt.text) return false;
+    const timestamp = message.createdAt ? Date.parse(message.createdAt) : NaN;
+    if (Number.isFinite(timestamp) && timestamp < attempt.after) return false;
+    return message.id ? !attempt.knownIds.includes(message.id) : Number.isFinite(timestamp) && timestamp >= attempt.after;
+  });
+}
+
+export function normalizeLoadedBatch(raw, expectedAccountId) {
+  if (!raw || raw.platform !== 'tinder' || !expectedAccountId || raw.accountId !== expectedAccountId || !Array.isArray(raw.conversations) || raw.conversations.length > 50) return null;
+  const conversations = raw.conversations.map(value => {
+    if (typeof value?.chatId !== 'string' || !value.chatId || !Array.isArray(value.messages) || value.messages.length > 500) return null;
+    const route = `/app/messages/${encodeURIComponent(value.chatId)}`;
+    const state = { routing: { pathname: route, params: { matchId: value.chatId } }, profile: { user: raw.accountProfile },
+      entities: { matches: { [value.chatId]: { person: value.profile, messages: value.messages, loadedMessageCount: value.loadedMessageCount } } } };
+    const result = conversationFromTinder(state, route);
+    return result?.accountId === expectedAccountId ? { ...result, source: 'loaded-bulk-import', currentReliable: false } : null;
+  });
+  if (conversations.some(value => !value)) return null;
+  return { conversations, nextCursor: Number.isInteger(raw.nextCursor) && raw.nextCursor >= 0 ? raw.nextCursor : null,
+    partial: true, unknownDateCount: Number.isInteger(raw.unknownDateCount) ? raw.unknownDateCount : 0 };
 }
 
 export function normalizeSiteSnapshot(raw, loc) {
@@ -93,14 +164,15 @@ export function normalizeSiteSnapshot(raw, loc) {
     const conversation = conversationFromTinder(raw.state, loc.pathname);
     const cardId = raw.state?.recs?.recs?.queues?.main?.[0];
     const card = raw.state?.entities?.profiles?.[cardId];
-    return { conversation, profile: card ? normalizeProfile(card) : null, source: 'loaded-app-state', route: loc.pathname };
+    return { conversation, profile: card ? normalizeProfile(card) : null, accountId: identifier(raw.state?.profile?.user?._id),
+      accountProfile: raw.state?.profile?.user?._id ? normalizeProfile(raw.state.profile.user) : null, source: 'loaded-app-state', route: loc.pathname };
   }
   return { conversation: conversationFromWhatsApp(raw.chat, loc.pathname), profile: null, source: 'loaded-app-state', route: loc.pathname };
 }
 
 export function incomingSnapshot(conversation) {
   const last = [...(conversation?.messages ?? [])].reverse().find(message => message.role === 'assistant' || message.role === 'unknown');
-  return JSON.stringify([conversation?.platform ?? '', conversation?.accountId ?? '', conversation?.chatId ?? '',
+  return JSON.stringify([conversation?.platform ?? '', conversation?.accountId ?? '', conversation?.accountScope ?? '', conversation?.chatId ?? '',
     last ? [last.id ?? '', last.text ?? '', last.createdAt ?? '', last.role] : []]);
 }
 

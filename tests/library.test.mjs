@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createLibrary, initialLibrary, mergeLibraries, renderStyle, validateLibrary } from '../extension/library.js';
+import { createLibrary, initialLibrary, mergeLibraries, renderStyle, validateLibrary, PROFILE_FIELDS, normalizeStoredProfile, getConversationKey, getNoteKey, getConversationNote } from '../extension/library.js';
 
 function harness() {
   let state = {}, rejectWrite = false;
@@ -185,4 +185,163 @@ test('conversation account identity is retained but never inferred', () => {
   const state = validateLibrary({ ...initialLibrary(), conversations: [{ chatId: 'known', accountId: 'verified', messages: [] }, { chatId: 'unknown', messages: [] }] });
   assert.equal(state.conversations[0].accountId, 'verified');
   assert.equal(state.conversations[1].accountId, '');
+});
+
+test('rich profiles and owner profiles retain only bounded evidenced fields', () => {
+  const profile = normalizeStoredProfile({ id: 'person', name: 'Person', age: 29, city: 'Oslo', interests: ['Climbing'],
+    descriptors: [{ id: 'education', name: 'Education', type: 'choice', value: 'University' }],
+    userPrompts: [{ id: 'prompt', question: 'Question?', answer: 'Answer' }],
+    spotify: { themeTrack: { name: 'Track', artists: ['Artist'] } }, birthDate: null });
+  assert.equal(profile.userPrompts[0].answer, 'Answer'); assert.equal(profile.spotify.themeTrack.artists[0], 'Artist');
+  assert.equal(profile.birthDate, null); assert.equal(profile.richPartial, true);
+  const state = validateLibrary({ ...initialLibrary(), conversations: [{ id: 'legacy-id', chatId: 'chat', accountId: 'owner', profile, accountProfile: { id: 'owner', name: 'Owner', bio: 'Owner bio' } }] });
+  assert.equal(state.conversations[0].id, 'legacy-id');
+  assert.equal(state.conversations[0].accountProfile.bio, 'Owner bio');
+  assert.deepEqual(Object.keys(profile).sort(), [...PROFILE_FIELDS].sort());
+  assert.throws(() => normalizeStoredProfile({ arbitraryPrivateData: true }));
+  assert.throws(() => normalizeStoredProfile({ photos: ['https://user:password@example.test/image.jpg'] }));
+  assert.throws(() => normalizeStoredProfile({ interests: Array(101).fill('too many') }));
+  assert.throws(() => validateLibrary({ ...state, conversations: [{ ...state.conversations[0], accountProfile: { id: 'wrong-owner' } }] }), /не соответствует/);
+});
+
+test('canonical keys isolate accounts and never truncate or rewrite legacy identities', () => {
+  const first = getConversationKey({ platform: 'tinder', accountId: 'a:b', chatId: 'c' });
+  const second = getConversationKey({ platform: 'tinder', accountId: 'a', chatId: 'b:c' });
+  assert.notEqual(first, second);
+  assert.equal(getNoteKey({ id: 'legacy-id', chatId: 'c' }), 'legacy-id');
+  assert.throws(() => getConversationKey({ platform: 'tinder', accountId: '😀'.repeat(100), chatId: '😀'.repeat(100) }), /ID/);
+});
+
+test('account-scoped notes never fall back across ambiguous accounts', async () => {
+  const { library } = harness();
+  await library.dispatch('save-note', { chatId: 'same', text: 'legacy owner unknown' });
+  const one = { chatId: 'same', platform: 'tinder', accountId: 'one', messages: [] };
+  const two = { chatId: 'same', platform: 'tinder', accountId: 'two', messages: [] };
+  await library.dispatch('capture', { conversation: one });
+  assert.equal(getConversationNote(await library.getState(), one).text, 'legacy owner unknown');
+  await library.dispatch('capture', { conversation: two });
+  assert.equal(getConversationNote(await library.getState(), one), null);
+  await assert.rejects(library.dispatch('save-note', { chatId: 'same', text: 'ambiguous' }), /Неоднозначный/);
+  await library.dispatch('save-note', { conversation: one, text: 'only one' });
+  await library.dispatch('append-note', { ...one, text: 'more' });
+  const state = await library.getState();
+  assert.equal(getConversationNote(state, one).text, 'only one\nmore');
+  assert.equal(getConversationNote(state, two), null);
+  assert.equal(getConversationNote(state, { ...two, id: getConversationKey(one) }), null);
+  assert.equal(state.notes.same.text, 'legacy owner unknown');
+});
+
+test('template aliases support original single braces and new double braces without replacing unknown data', () => {
+  const values = { personName: 'Person', bio: 'Bio', accountName: 'Owner', accountBio: 'Owner bio', aboutAccountProfile: 'Interests: music',
+    aboutPersonProfile: 'Interests: climbing', matchRichFields: 'Education: university', datetime: 'known time', platform: 'tinder' };
+  assert.equal(renderStyle('{personName} {{name}} {accountName} {{accountBio}} {datetime} {unknown} {{unknown}}', values), 'Person Person Owner Owner bio known time {unknown} {{unknown}}');
+  assert.equal(renderStyle('{aboutAccountProfile}|{aboutPersonProfile}|{{matchRichFields}}|{platform}', values), 'Interests: music|Interests: climbing|Education: university|tinder');
+});
+
+test('assistant tool results persist structured data and require owner confirmation for drafts', async () => {
+  const { library } = harness();
+  const results = [
+    { type: 'suggestions', replies: [{ text: 'A reply', reason: 'Reason' }] },
+    { type: 'draft-style', style: { name: 'Draft', prompt: 'Prompt', useHistory: false }, requiresConfirmation: true },
+    { type: 'past-replies', query: 'coffee', currentAccountOnly: true, source: 'server-history', results: [{ conversationId: 'tinder:owner:chat', chatId: 'chat', accountId: 'owner', platform: 'tinder', theirText: 'Coffee?', myReply: 'Yes', sentAt: null, messageId: 'old', partial: true }] },
+  ];
+  await library.dispatch('save-chat', { chat: { id: 'tools', messages: [{ id: 'answer', role: 'assistant', text: 'Answer', toolResults: results }] } });
+  assert.deepEqual((await library.getState()).assistantChats[0].messages[0].toolResults, results);
+  await assert.rejects(library.dispatch('save-chat', { chat: { id: 'invalid-tools', messages: [{ role: 'assistant', text: '', toolResults: [{ ...results[1], requiresConfirmation: false }] }] } }));
+  assert.equal((await library.getState()).styles.length, 2, 'no generated style was automatically saved');
+});
+
+test('forking an edited or regenerated turn preserves the original confirmed history', async () => {
+  const { library } = harness();
+  const original = { id: 'original', title: 'Original', messages: [{ id: 'u1', role: 'user', text: 'first' }, { id: 'a1', role: 'assistant', text: 'answer' }, { id: 'u2', role: 'user', text: 'second' }] };
+  await library.dispatch('save-chat', { chat: original });
+  const before = (await library.getState()).assistantChats[0];
+  await library.dispatch('fork-chat', { sourceId: 'original', messageId: 'u2', text: 'edited second' });
+  let state = await library.getState();
+  assert.deepEqual(state.assistantChats.find(chat => chat.id === 'original'), before);
+  const edited = state.assistantChats.find(chat => chat.id !== 'original');
+  assert.equal(edited.draft, 'edited second'); assert.equal(edited.messages.length, 2);
+  await library.dispatch('fork-chat', { sourceId: 'original', messageId: 'a1' });
+  state = await library.getState();
+  const regenerated = state.assistantChats.find(chat => !['original', edited.id].includes(chat.id));
+  assert.equal(regenerated.messages.length, 0); assert.equal(regenerated.draft, 'first');
+});
+
+test('assistant prompt and reply-language settings are strict and do not alter UI language', async () => {
+  const { library } = harness();
+  await library.dispatch('save-settings', { settings: { replyLanguage: 'en', assistantPrompts: { useCustom: true, base: 'Base', chat: 'Chat', profile: 'Profile' } } });
+  const state = await library.getState();
+  assert.equal(state.settings.replyLanguage, 'en'); assert.equal(state.settings.language, 'ru');
+  assert.equal(state.settings.assistantPrompts.profile, 'Profile');
+  await assert.rejects(library.dispatch('save-settings', { settings: { assistantPrompts: { unknown: 'bad' } } }));
+});
+
+test('unknown account labels isolate histories and notes without verifying or enabling sending', async () => {
+  const { library } = harness();
+  const first = { platform: 'whatsapp', accountId: '', accountScope: 'personal', chatId: 'same-peer', messages: [{ id: 'a', role: 'outgoing', text: 'personal' }] };
+  const second = { ...first, accountScope: 'work', messages: [{ id: 'b', role: 'outgoing', text: 'work' }] };
+  await library.dispatch('capture', { conversation: first });
+  await library.dispatch('capture', { conversation: second });
+  await library.dispatch('save-note', { conversation: first, text: 'private personal note' });
+  const state = await library.getState();
+  assert.equal(state.conversations.length, 2);
+  assert.notEqual(getConversationKey(first), getConversationKey(second));
+  assert.equal(getConversationNote(state, first).text, 'private personal note');
+  assert.equal(getConversationNote(state, second), null);
+  assert.equal(getConversationNote(state, { ...first, accountScope: '' }), null);
+  assert.ok(state.conversations.every(item => item.accountId === ''));
+  assert.equal(state.settings.autoSendEnabled, false);
+  assert.throws(() => getConversationKey({ ...first, accountScope: 'x'.repeat(101) }));
+  await assert.rejects(library.dispatch('append-note', { chatId: 'same-peer', text: 'ambiguous' }), /Неоднозначный/);
+});
+
+test('conflicting legacy conversation identities reject capture and import without mutating either history', async () => {
+  const h = harness();
+  await h.library.dispatch('capture', { conversation: { id: 'legacy-shared', platform: 'tinder', accountId: 'a', chatId: 'peer', messages: [{ id: 'a', text: 'first owner' }] } });
+  const before = h.snapshot();
+  for (const conflict of [{ accountId: 'b' }, { platform: 'whatsapp' }, { chatId: 'other' }, { accountScope: 'changed-scope' }]) {
+    const incoming = { ...before.library.conversations[0], ...conflict, messages: [{ id: 'b', text: 'other owner' }], updatedAt: '2099-01-01T00:00:00Z' };
+    assert.throws(() => mergeLibraries(before.library, { ...initialLibrary(), conversations: [incoming] }), /Конфликт идентичности/);
+    await assert.rejects(h.library.dispatch('capture', { conversation: incoming }), /Конфликт идентичности/);
+    await assert.rejects(h.library.dispatch('import', { data: { version: 1, conversations: [incoming] }, mode: 'merge' }), /Конфликт идентичности/);
+    assert.deepEqual(h.snapshot(), before);
+  }
+});
+
+test('backfilled captures preserve observed message order and archived messages with unknown times', async () => {
+  const { library } = harness();
+  const message = id => ({ id, role: 'unknown', text: id, createdAt: null });
+  const snapshot = ids => ({ id: 'backfill', chatId: 'backfill', messages: ids.map(message) });
+  await library.dispatch('capture', { conversation: snapshot(['m3', 'm4']) });
+  await library.dispatch('capture', { conversation: snapshot(['m1', 'm2', 'm3', 'm4']) });
+  await library.dispatch('capture', { conversation: snapshot(['m4', 'm5']) });
+  let state = await library.getState();
+  assert.deepEqual(state.conversations[0].messages.map(item => item.id), ['m1', 'm2', 'm3', 'm4', 'm5']);
+  const merged = mergeLibraries(state, { ...initialLibrary(), conversations: [{ ...snapshot(['m0', 'm1', 'm2']), updatedAt: '2099-01-01T00:00:00Z' }] });
+  assert.deepEqual(merged.conversations[0].messages.map(item => item.id), ['m0', 'm1', 'm2', 'm3', 'm4', 'm5']);
+  assert.ok(merged.conversations[0].messages.every(item => item.createdAt === null));
+});
+
+test('schedule records preserve account scope and atomic claim rejects a different known account', async () => {
+  const { library } = harness();
+  await library.dispatch('save-settings', { settings: { autoSendEnabled: true } });
+  await library.dispatch('schedule', { item: { id: 'owner-schedule', chatId: 'peer', platform: 'tinder', accountId: 'owner', text: 'draft', fireAt: '2020-01-01T00:00:00Z', sendMode: 'automatic', incomingSnapshot: 'same' } });
+  await assert.rejects(library.dispatch('claim-schedule', { id: 'owner-schedule', chatId: 'peer', accountId: 'other', incomingSnapshot: 'same' }));
+  assert.equal((await library.getState()).schedules[0].status, 'scheduled');
+  await library.dispatch('schedule', { item: { id: 'review-scoped', chatId: 'peer', platform: 'whatsapp', accountScope: 'personal', text: 'review', fireAt: '2030-01-01T00:00:00Z' } });
+  assert.equal((await library.getState()).schedules[1].accountScope, 'personal');
+});
+
+test('tool-only assistant turns and fork task/context metadata persist without executing tools', async () => {
+  const { library } = harness();
+  await library.dispatch('save-chat', { chat: { id: 'tool-context', messages: [
+    { id: 'u', role: 'user', text: 'create a style', task: 'create-style', conversationId: 'context', contextKind: 'chat' },
+    { id: 'a', role: 'assistant', text: '', incomplete: true, finishReason: 'tool-limit', conversationId: 'context', toolResults: [{ type: 'draft-style', style: { name: 'Draft', prompt: 'Prompt', useHistory: false }, requiresConfirmation: true }] },
+  ] } });
+  await library.dispatch('fork-chat', { sourceId: 'tool-context', messageId: 'a' });
+  const state = await library.getState();
+  assert.equal(state.assistantChats[0].messages[1].incomplete, true);
+  assert.equal(state.assistantChats[1].draftTask, 'create-style');
+  assert.equal(state.assistantChats[1].contextId, 'context');
+  assert.equal(state.styles.length, 2);
 });

@@ -1,8 +1,9 @@
 import { canUseApp, suggestReplies } from './core.js';
-import { renderStyle } from './library.js';
+import { renderStyle, getConversationNote } from './library.js';
 import { serverRequest, streamServer } from './server-client.js';
+import { templateValues, searchOwnPastReplies, assistantPrompt, generationContext } from './prompt-context.js';
 
-export function prepareTask(task, payload, options) {
+export function prepareTask(task, payload, options = {}) {
   const state = options.library ?? { settings: options.settings ?? {}, styles: [], notes: {}, memories: [], conversations: [] };
   const settings = state.settings;
   const style = payload.styleId ? state.styles.find(item => item.id === payload.styleId && !item.deleted) : undefined;
@@ -10,43 +11,46 @@ export function prepareTask(task, payload, options) {
   let text = payload.text;
   let messages = payload.messages;
   let attachments = payload.attachments ?? [];
-  if (task === 'assistant' && Array.isArray(messages) && messages.length) {
+  if (task !== 'replies' && payload.text == null && Array.isArray(messages) && messages.length) {
     const last = messages.at(-1);
-    if (last.role !== 'user') throw new Error('Последнее сообщение должно принадлежать пользователю.');
+    if (!['user', 'outgoing'].includes(last.role)) throw new Error('Последнее сообщение должно принадлежать пользователю.');
     text = last.text ?? last.content;
     attachments = last.attachments ?? attachments;
-    messages = messages.slice(0, -1).map(message => ({ role: message.role, text: message.text ?? message.content, attachments: message.attachments ?? [] }));
+    messages = messages.slice(0, -1).map(message => ({ role: message.role, text: message.text ?? message.content,
+      attachments: message.attachments ?? [], toolResults: message.toolResults ?? [] }));
   }
   if (typeof text !== 'string' || !text.trim() || text.length > 10000) throw new Error('Текст запроса: от 1 до 10 000 символов.');
-  const context = payload.context ? structuredClone(payload.context) : null;
+  const contextKind = payload.contextKind === 'profile' ? 'profile' : 'chat';
+  const context = generationContext(task, payload.context, contextKind);
   if (context && !payload.includePhotos) {
     context.photos = [];
     if (context.profile) context.profile.photos = [];
+    if (context.accountProfile) context.accountProfile.photos = [];
   }
   const memories = state.memories.filter(item => !item.deleted && item.enabled !== false);
-  const notes = state.notes[context?.chatId]?.text ?? payload.notes ?? '';
-  const transcript = (context?.messages ?? []).map(message => `${message.role}: ${message.text}`).join('\n');
-  const systemPrompt = renderStyle(style?.prompt || payload.systemPrompt || settings.systemPrompt || '', {
-    name: context?.profile?.name, bio: context?.profile?.bio, transcript, notes,
-    memories: memories.map(item => item.text).join('\n'),
-  });
+  const notes = getConversationNote(state, context)?.text ?? (context ? '' : payload.notes ?? '');
+  const variables = templateValues(context, { notes, memories, now: options.now ?? Date.now() });
+  const customPrompt = renderStyle(style?.prompt || payload.systemPrompt || settings.systemPrompt || '', variables);
+  const systemPrompt = [task === 'assistant' ? assistantPrompt(settings, contextKind) : '', customPrompt].filter(Boolean).join('\n\n');
+  if (systemPrompt.length > 30000) throw new Error('Инструкция после подстановки переменных превышает 30 000 символов. Сократите шаблон или контекст.');
   const count = payload.count ?? style?.suggestionCount ?? settings.suggestionCount ?? 3;
   if (!Number.isInteger(count) || count < 1 || count > 3) throw new Error('Количество ответов: от 1 до 3.');
   let historyMatches = [];
-  if (style?.useHistory) {
-    const words = new Set(text.toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
-    historyMatches = state.conversations.filter(item => !item.deleted).flatMap(conversation => conversation.messages
-      .filter(message => ['user', 'outgoing'].includes(message.role))
-      .map(message => ({ text: message.text, score: [...words].filter(word => message.text.toLocaleLowerCase().includes(word)).length })))
-      .filter(item => item.score).sort((a, b) => b.score - a.score).slice(0, 10).map(({ text }) => text);
+  const allowHistorySearch = payload.allowHistorySearch === true || style?.useHistory === true;
+  const allowAllAccountsHistory = payload.allowAllAccountsHistory === true;
+  if (allowHistorySearch) {
+    const lastIncoming = [...(context?.messages ?? [])].reverse().find(item => ['assistant', 'incoming'].includes(item.role));
+    const query = [lastIncoming?.text, text].filter(Boolean).join('\n');
+    historyMatches = searchOwnPastReplies(state.conversations, query, context, { allAccounts: allowAllAccountsHistory });
   }
-  const photos = payload.includePhotos ? (payload.context?.photos ?? payload.context?.profile?.photos ?? []).slice(0, 8) : [];
+  const photos = payload.includePhotos ? (contextKind === 'profile' ? payload.context?.accountProfile?.photos ?? [] : payload.context?.photos ?? payload.context?.profile?.photos ?? []).slice(0, 8) : [];
   if (attachments.length + photos.length > 8) throw new Error('Максимум 8 вложений и фотографий в одном запросе.');
   return { text: text.trim(), tone: payload.tone, context: historyMatches.length ? { ...context, historyMatches } : context,
-    messages, attachments: [...attachments, ...photos],
+    messages, attachments: [...attachments, ...photos], contextKind, allowHistorySearch, allowAllAccountsHistory,
     count, model: payload.model || style?.model || settings[task === 'replies' ? 'suggestionModel' : 'assistantModel'] || options.model,
     provider: payload.provider || settings[task === 'replies' ? 'suggestionProvider' : 'assistantProvider'] || settings.provider || 'openai', systemPrompt, memories, notes,
     language: payload.targetLanguage ?? payload.language ?? settings.language ?? 'ru',
+    replyLanguage: payload.replyLanguage ?? settings.replyLanguage ?? 'auto',
     temperature: payload.temperature ?? style?.temperature, maxTokens: payload.maxTokens ?? style?.maxTokens,
     ...(style ? { style: { ...style, prompt: systemPrompt } } : {}) };
 }

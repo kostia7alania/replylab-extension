@@ -44,3 +44,36 @@ test('malformed remote replies fail instead of falling back to local replies', a
     fetchImpl: async () => ({ ok: true, json: async () => ({ replies: [{ text: '<script>bad</script>' }] }) }),
   }), /неверный формат/);
 });
+
+test('rich owner/person variables and scoped notes reach the prompt without leaking another account', () => {
+  const context = { platform: 'tinder', accountId: 'A', chatId: 'peer', profile: { name: 'Alice', bio: 'Books', interests: ['hiking'] }, accountProfile: { name: 'Alex', bio: 'Cycling' }, messages: [] };
+  const state = { settings: { replyLanguage: 'en' }, styles: [], memories: [], notes: { peer: { text: 'Ambiguous private note', updatedAt: new Date().toISOString() } }, conversations: [
+    { id: 'A-peer', platform: 'tinder', accountId: 'A', chatId: 'peer', messages: [] },
+    { id: 'B-peer', platform: 'tinder', accountId: 'B', chatId: 'peer', messages: [] },
+  ] };
+  const result = prepareTask('replies', { text: 'Reply', context, notes: 'Unsafe legacy fallback', systemPrompt: '{accountName}: {{accountBio}} / {personName}: {aboutPersonProfile} / {notes}' }, { library: state });
+  assert.match(result.systemPrompt, /Alex: Cycling/); assert.match(result.systemPrompt, /Alice/); assert.match(result.systemPrompt, /hiking/);
+  assert.equal(result.systemPrompt.includes('private note'), false); assert.equal(result.systemPrompt.includes('legacy fallback'), false);
+  assert.equal(result.replyLanguage, 'en');
+});
+
+test('profile-only assistant context excludes the other person and their conversation', () => {
+  const context = { platform: 'tinder', accountId: 'A', chatId: 'peer', profile: { name: 'Other', photos: ['https://example.test/other.jpg'] }, accountProfile: { name: 'Owner', photos: ['https://example.test/me.jpg'] }, messages: [{ role: 'assistant', text: 'Private chat text' }] };
+  const result = prepareTask('assistant', { text: 'Review my profile', contextKind: 'profile', context, includePhotos: true }, {});
+  assert.equal(result.context.profile, null); assert.deepEqual(result.context.messages, []);
+  assert.deepEqual(result.attachments, ['https://example.test/me.jpg']);
+});
+
+test('follow-up assistant messages keep reviewed tool results as history data', () => {
+  const toolResults = [{ type: 'suggestions', replies: [{ text: 'A', reason: 'Reason' }] }];
+  const result = prepareTask('assistant', { messages: [{ role: 'user', text: 'Suggest' }, { role: 'assistant', text: 'Options', toolResults }, { role: 'user', text: 'Change the first' }] }, {});
+  assert.equal(result.text, 'Change the first'); assert.deepEqual(result.messages[1].toolResults, toolResults);
+});
+
+test('style creation excludes the other person biography and incoming conversation facts', () => {
+  const result = prepareTask('create-style', { text: 'Create a warm style', context: { platform: 'tinder', accountId: 'A', chatId: 'peer',
+    accountProfile: { name: 'Alex', bio: 'Cycling' }, profile: { name: 'Alice', bio: 'Hiking and coffee' },
+    messages: [{ role: 'assistant', text: 'My hobby is hiking' }, { role: 'user', text: 'Nice to meet you' }] } }, {});
+  assert.equal(result.context.profile, null); assert.equal(result.context.accountProfile.bio, 'Cycling');
+  assert.deepEqual(result.context.messages.map(item => item.text), ['Nice to meet you']);
+});

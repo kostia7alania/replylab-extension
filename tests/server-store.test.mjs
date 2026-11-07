@@ -126,3 +126,49 @@ test('server claim rejects a changed text/version without reserving the job', as
   await assert.rejects(store.claimSchedule({ id: 'v', fireAt, deviceId: 'd', incomingSnapshot: 'same', expectedText: 'Stale' }), error => error.status === 409);
   assert.equal((await store.claimSchedule({ id: 'v', fireAt, deviceId: 'd', incomingSnapshot: 'same', expectedText: 'Current', expectedUpdatedAt: fireAt })).claimed, true);
 });
+
+test('own-server catalog and versioned templates are real persistent CRUD without a seeded public catalog', async t => {
+  const { store, directory } = await storeFor(t);
+  assert.deepEqual((await store.catalog()).items, []); assert.deepEqual((await store.templates()).items, []);
+  const saved = await store.saveCatalog({ name: 'Tea', prompt: 'Use {{name}} naturally.' });
+  assert.equal(saved.item.shared, true); assert.equal(saved.revision, 1);
+  await store.saveCatalog({ prompt: 'Updated instruction.' }, saved.item.id);
+  const template = await store.saveTemplate({ name: 'Base', scope: 'assistant-base', prompt: 'Facts only.' });
+  const edited = await store.saveTemplate({ prompt: 'Facts and questions.' }, template.item.id);
+  assert.equal(edited.item.version, 2);
+  const restarted = createStore({ directory });
+  assert.equal((await restarted.catalog()).items[0].prompt, 'Updated instruction.');
+  assert.equal((await restarted.templates()).items[0].prompt, 'Facts and questions.');
+  await restarted.merge({ memories: [record('m', 'Keep this')] });
+  assert.equal((await restarted.templates()).items[0].version, 2);
+  await restarted.deleteCatalog(saved.item.id); await restarted.deleteTemplate(template.item.id);
+  assert.equal((await restarted.catalog()).items.length, 0); assert.equal((await restarted.templates()).items.length, 0);
+  assert.equal((await restarted.read()).state.styles[0].deleted, true);
+  await assert.rejects(restarted.saveTemplate({ name: 'Invalid', scope: 'unknown', prompt: 'No' }), /область/);
+  await assert.rejects(restarted.saveTemplate({ name: 'Invalid', scope: 'reply', prompt: 'No', apiKey: 'not-a-key' }), /поле/);
+  await assert.rejects(restarted.saveCatalog({ prompt: 'Missing' }, 'missing'), error => error.status === 404);
+});
+
+test('past reply pairs search is Unicode normalized and defaults to the confirmed current account', async t => {
+  const { store } = await storeFor(t);
+  const conversation = (id, accountId, platform, ownText) => ({ id, chatId: id, accountId, platform, partial: true, messages: [
+    { id: id + '-peer', role: 'assistant', text: 'Ёлка, кофе?', createdAt: null },
+    { id: id + '-own', role: 'user', text: ownText, createdAt: null },
+  ] });
+  await store.merge({ conversations: [conversation('a', 'account-a', 'tinder', 'Кофе завтра'), conversation('b', 'account-b', 'tinder', 'Other account'), conversation('wa', 'account-a', 'whatsapp', 'Other platform')] });
+  const result = await store.searchPastReplies({ query: 'ЕЛКА кофе', accountId: 'account-a', platform: 'tinder' });
+  assert.equal(result.length, 1); assert.equal(result[0].myReply, 'Кофе завтра'); assert.equal(result[0].theirText, 'Ёлка, кофе?'); assert.equal(result[0].sentAt, null); assert.equal(result[0].accountId, 'account-a');
+  assert.equal((await store.searchPastReplies({ query: 'кофе', current_account_only: false, platform: 'tinder' })).length, 2);
+  assert.deepEqual(await store.searchPastReplies({ query: 'not-in-history', accountId: 'account-a' }), []);
+  await assert.rejects(store.searchPastReplies({ query: 'кофе' }), /аккаунт/);
+});
+
+test('history excerpts mark truncation and never attribute an unknown sender message to an earlier incoming text', async t => {
+  const { store } = await storeFor(t);
+  await store.merge({ conversations: [{ id: 'c', chatId: 'c', accountId: 'a', platform: 'tinder', partial: false, messages: [
+    { id: 'old-peer', role: 'assistant', text: 'Old incoming', createdAt: null }, { id: 'unknown', role: 'unknown', text: 'Unknown sender', createdAt: null },
+    { id: 'reply', role: 'user', text: 'needle ' + 'a'.repeat(6000), createdAt: null },
+  ] }] });
+  const results = await store.searchPastReplies({ query: 'needle', accountId: 'a' });
+  assert.equal(results[0].theirText, ''); assert.equal(results[0].partial, true); assert.equal(results[0].myReply.length, 5000);
+});
